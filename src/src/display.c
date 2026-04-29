@@ -267,6 +267,44 @@ void display_draw_image(const uint16_t *img, uint16_t x, uint16_t y,
     LCD_CS_HIGH();
 }
 
+void display_draw_chunk_2x(const uint16_t *src, uint16_t log_row,
+                           uint16_t log_w, uint16_t log_h)
+{
+    /* Blit a log_w × log_h logical-pixel chunk to the physical display,
+     * scaling 2× in both axes (each logical pixel → 2×2 physical pixels).
+     * Physical output region: (0, log_row*2) to (127, log_row*2 + log_h*2 - 1).
+     *
+     * Used by the 64×80 SWD streamer for half-resolution Doom streaming:
+     *   log_w=64, log_h=16  →  128×32 physical pixels per chunk.
+     *
+     * Inner loop sends each logical pixel four times (hi,lo,hi,lo) to
+     * produce two horizontally-adjacent physical pixels; the outer pass
+     * loop repeats each logical row twice for vertical doubling.
+     * Total SPI output: log_w * log_h * 4 * 2 bytes = same as 128×(log_h*2). */
+    uint16_t pr = (uint16_t)(log_row * 2u);
+    LCD_CS_LOW();
+    display_set_window(0u, pr, 127u, (uint16_t)(pr + log_h * 2u - 1u));
+    LCD_DC_DATA();
+    for (uint16_t lr = 0u; lr < log_h; lr++) {
+        const uint16_t *row = src + (uint32_t)lr * log_w;
+        for (uint8_t pass = 0u; pass < 2u; pass++) {   /* vertical × 2 */
+            for (uint16_t lc = 0u; lc < log_w; lc++) { /* horizontal × 2 */
+                uint16_t px = row[lc];
+                uint8_t  hi = (uint8_t)(px >> 8);
+                uint8_t  lo = (uint8_t)(px & 0xFFu);
+                /* left physical pixel */
+                while (!(SPI1->SR & SPI_SR_TXE)); *(volatile uint8_t *)&SPI1->DR = hi;
+                while (!(SPI1->SR & SPI_SR_TXE)); *(volatile uint8_t *)&SPI1->DR = lo;
+                /* right physical pixel (same colour) */
+                while (!(SPI1->SR & SPI_SR_TXE)); *(volatile uint8_t *)&SPI1->DR = hi;
+                while (!(SPI1->SR & SPI_SR_TXE)); *(volatile uint8_t *)&SPI1->DR = lo;
+            }
+        }
+    }
+    while (SPI1->SR & SPI_SR_BSY);
+    LCD_CS_HIGH();
+}
+
 void display_set_backlight(uint8_t on) {
     if (on == 0)
         LCD_BL_PORT->BSRR = (1UL << LCD_BL_PIN);           /* HIGH = off */
@@ -288,6 +326,70 @@ void display_sleep_out(void) {
     LCD_CS_LOW(); lcd_write_cmd(0x29); LCD_CS_HIGH(); /* Display On */
     delay_ms(10);
     display_set_backlight(1);
+}
+
+void display_draw_chunk_cpu(const uint16_t *buf, uint16_t row_start, uint16_t nrows)
+{
+    /* CPU-polled SPI blit: identical to display_draw_image but fixed full-width.
+     * Simpler than DMA — avoids DMA channel-mapping uncertainty on N32G031.
+     * At 24 MHz SPI (PLL mode) each 128×16 chunk takes ~1.4 ms.             */
+    LCD_CS_LOW();
+    display_set_window(0u, row_start,
+                       (uint16_t)(LCD_WIDTH - 1u),
+                       (uint16_t)(row_start + nrows - 1u));
+    LCD_DC_DATA();
+    uint32_t npix = (uint32_t)LCD_WIDTH * nrows;
+    for (uint32_t i = 0; i < npix; i++) {
+        uint16_t px = buf[i];
+        while (!(SPI1->SR & SPI_SR_TXE)); *(volatile uint8_t *)&SPI1->DR = (uint8_t)(px >> 8);
+        while (!(SPI1->SR & SPI_SR_TXE)); *(volatile uint8_t *)&SPI1->DR = (uint8_t)(px & 0xFF);
+    }
+    while (SPI1->SR & SPI_SR_BSY);
+    LCD_CS_HIGH();
+}
+
+void display_draw_chunk_dma(const uint16_t *buf, uint16_t row_start, uint16_t nrows)
+{
+    /* Blit a 128×nrows chunk from buf to the display using DMA-driven SPI.
+     *
+     * Unlike display_draw_image(), the CPU does NOT poll SPI_SR_TXE per byte.
+     * DMA1 Channel 3 owns the AHB bus for the SPI transfer, so the CPU (and
+     * therefore the SWD master) can write to SRAM without contention.
+     * This is what makes PLL useful: at 48 MHz the CPU would otherwise hammer
+     * the bus in a tight polling loop, adding wait-states to every SWD write.
+     *
+     * Sequence:
+     *   1. Set GRAM window and issue RAMWR (display_set_window leaves CS LOW).
+     *   2. Point DMA1_CH3 at SPI1->DR (peripheral) and buf (memory).
+     *   3. Enable SPI TX DMA request (SPI_CR2_TXDMAEN).
+     *   4. Poll DMA ISR TCIF3 — CPU is idle, AHB free for SWD.
+     *   5. Wait for SPI BSY to drain the shift register before raising CS.
+     */
+    LCD_CS_LOW();
+    display_set_window(0u, row_start,
+                       (uint16_t)(LCD_WIDTH - 1u),
+                       (uint16_t)(row_start + nrows - 1u));
+    LCD_DC_DATA();
+
+    /* Configure DMA1 Channel 3 for SPI1 TX (memory → peripheral, 8-bit). */
+    DMA1_CH3->CCR   = 0;                               /* disable first      */
+    DMA1_CH3->CPAR  = (uint32_t)&SPI1->DR;             /* fixed: SPI data reg */
+    DMA1_CH3->CMAR  = (uint32_t)buf;                   /* source: chunk buf  */
+    DMA1_CH3->CNDTR = (uint32_t)LCD_WIDTH * nrows * 2u;/* bytes (2 per pixel)*/
+    DMA1_CH3->CCR   = DMA_CCR_DIR    /* mem→periph */
+                    | DMA_CCR_MINC   /* memory increments */
+                    | DMA_CCR_PL_HIGH/* high priority */
+                    | DMA_CCR_EN;    /* go */
+
+    SPI1->CR2 |= SPI_CR2_TXDMAEN;   /* arm SPI to request DMA on TXE */
+
+    /* CPU idles here — DMA owns AHB, SWD writes go uncontested. */
+    while (!(DMA1->ISR & DMA_ISR_TCIF3)) { IWDG_FEED(); }
+    DMA1->IFCR = DMA_IFCR_CTCIF3;   /* clear TC flag */
+
+    while (SPI1->SR & SPI_SR_BSY);  /* drain shift register before CS high */
+    SPI1->CR2 &= ~SPI_CR2_TXDMAEN;
+    LCD_CS_HIGH();
 }
 
 void display_draw_pixel(uint16_t x, uint16_t y, uint16_t color) {

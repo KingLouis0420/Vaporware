@@ -74,12 +74,57 @@ uint32_t millis(void) {
     return (uint32_t)TIM1->CNT;
 }
 
+void clock_boost_48mhz(void) {
+    /* Upgrade SYSCLK from 8 MHz HSI to 48 MHz (HSI × 6 via PLL).
+     *
+     * Must be called after clock_init() (TIM3 running at 1 MHz / PSC=7)
+     * and before display_init() or any SPI use.
+     *
+     * Effects:
+     *   • SYSCLK / APB2 → 48 MHz  (SPI1 BR_DIV2 → 24 MHz automatically)
+     *   • TIM3 PSC updated 7 → 47  (keeps 1 MHz / 1 ms tick)
+     *   • Flash: 1 wait-state set before the switch (required above 24 MHz)
+     *
+     * PLL maths: RCC_CFGR_PLLMULL_6 = (4UL<<18) → ×6 multiplier.
+     * PLLSRC = 0 selects HSI direct (8 MHz, NOT HSI/2 on this device).
+     * 8 MHz × 6 = 48 MHz — confirmed by n32g031.h comment. */
+
+    /* 1. Flash: 1 wait state + prefetch — MUST come before the clock switch */
+    FLASH_IF->ACR = (1UL << 4) | (1UL << 0);   /* PRFTBE | LATENCY_1WS */
+
+    /* 2. Configure PLL: HSI (PLLSRC=0) × 6 (PLLMULL_6) */
+    RCC->CFGR = (RCC->CFGR & ~((0xFUL << 18) | (1UL << 16)))
+              | RCC_CFGR_PLLMULL_6;             /* bit16=0 (HSI src) */
+
+    /* 3. Enable PLL; wait for hardware lock */
+    RCC->CR |= (1UL << 24);                     /* PLLON */
+    while (!(RCC->CR & (1UL << 25)));           /* spin on PLLRDY */
+
+    /* 4. Switch SYSCLK source to PLL */
+    RCC->CFGR = (RCC->CFGR & ~0x3UL) | RCC_CFGR_SW_PLL;
+    while ((RCC->CFGR & 0xCUL) != RCC_CFGR_SWS_PLL);  /* wait for SWS==PLL */
+
+    /* 5. Recalibrate TIM3: 48 MHz / (47+1) = 1 MHz → 1 ms tick unchanged */
+    TIM3->CR1 = 0;
+    TIM3->PSC = 47;
+    TIM3->EGR = TIM_EGR_UG;
+    TIM3->SR  = 0;
+    TIM3->CR1 = TIM_CR1_CEN;
+}
+
 void tim1_init(void) {
     /* Enable TIM1 clock on APB2 (TIM1EN = APB2ENR bit 11) */
     RCC->APB2ENR |= RCC_APB2ENR_TIM1EN;
 
     TIM1->CR1 = 0;
-    TIM1->PSC = 7999;    /* 8 MHz HSI / (7999+1) = 1 kHz → 1 count per ms */
+
+    /* Auto-detect SYSCLK so this function is correct whether called before or
+     * after clock_boost_48mhz().
+     *   HSI 8 MHz:  PSC = 7999  → 8 000 000 / 8000 = 1 kHz
+     *   PLL 48 MHz: PSC = 47999 → 48 000 000 / 48000 = 1 kHz
+     * SWS[1:0] (RCC_CFGR bits[3:2]) = 0b10 means PLL is the clock source. */
+    uint32_t psc = ((RCC->CFGR & 0xCUL) == RCC_CFGR_SWS_PLL) ? 47999u : 7999u;
+    TIM1->PSC = psc;
     TIM1->ARR = 0xFFFF;  /* Full 16-bit range: wraps after 65535 ms */
 
     /* UG: force-load PSC and ARR shadow registers; reset CNT.

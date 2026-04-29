@@ -4,6 +4,11 @@ examples/*/build/
 # Generated OpenOCD flash script (produced by gen_direct_flash.py)
 direct_flash.tcl
 
+# Streamer runtime artifacts
+examples/streamer/chunk_buf.bin
+examples/streamer/*.txt
+examples/streamer/doom/
+
 # Compiled simulation binaries
 examples/slots/sim/slots_sim
 
