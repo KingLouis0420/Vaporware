@@ -4,9 +4,9 @@
  * baseline.  The only addition is the SWD streaming protocol loop in place of
  * the game loop.
  *
- * Clock: 48 MHz via PLL (HSI × 6).  clock_boost_48mhz() called before
- *   display_init() so SPI1 runs at 24 MHz (BR_DIV2 of APB2=48MHz).
- *   Each 128×8 chunk blits in ~1.4 ms vs ~8 ms at 4 MHz.
+ * Clock: 8 MHz HSI, no PLL.  SPI1 runs at 4 MHz (BR_DIV2 of APB2=8MHz).
+ *   Each 128×8 chunk blits in ~4 ms.  PLL boost (24 MHz SPI) is deferred
+ *   until we verify the physical board handles higher SPI speeds.
  *
  * Double-buffer SRAM layout — two ping-pong buffers of 128×8 rows each:
  *
@@ -86,9 +86,8 @@ int main(void)
 
     /* ── Core hardware init (identical to flappy.c) ─────────────────────── */
     clock_init();              /* 8 MHz HSI, TIM3 PSC=7 → 1 ms ticks         */
-    clock_boost_48mhz();       /* PLL: 8→48 MHz; updates TIM3 PSC; SPI→24 MHz*/
     delay_ms(50);
-    display_init();            /* 24 MHz SPI — 128×8 chunk blits in ~1.4 ms  */
+    display_init();            /*  4 MHz SPI — 128×8 chunk blits in ~4 ms    */
     display_set_backlight(80);
     tim1_init();
     bat_init();            /* ADC init — included because flappy includes it  */
