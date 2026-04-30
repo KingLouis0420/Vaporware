@@ -4,19 +4,26 @@
  * baseline.  The only addition is the SWD streaming protocol loop in place of
  * the game loop.
  *
- * Clock: 8 MHz HSI throughout.  No PLL boost.  SPI runs at 4 MHz.
- *   This matches flappy exactly and guarantees display_init() works.
+ * Clock: 48 MHz via PLL (HSI × 6).  clock_boost_48mhz() called before
+ *   display_init() so SPI1 runs at 24 MHz (BR_DIV2 of APB2=48MHz).
+ *   Each 128×8 chunk blits in ~1.4 ms vs ~8 ms at 4 MHz.
  *
- * SRAM layout (one write_memory per chunk):
+ * Double-buffer SRAM layout — two ping-pong buffers of 128×8 rows each:
  *
- *   CTRL      @ 0x20000010  0xDEAD0000 = reset display
- *   FAST_IDX  @ 0x20000100  chunk index 0-9         (4 bytes)
- *   FAST_BUF  @ 0x20000104  pixel data 128x16x2 B   (4096 bytes)
- *   FAST_TRIG @ 0x20001104  0xCC = chunk ready       (4 bytes) <- written LAST
+ *   CTRL       @ 0x20000010  0xDEAD0000 = reset display    (4 bytes)
+ *   IDX_A      @ 0x20000100  chunk index for buffer A       (4 bytes)
+ *   BUF_A      @ 0x20000104  pixel data 128×8×2 B = 2048 B (2048 bytes)
+ *   TRIG_A     @ 0x20000904  0xCC = buffer A ready          (4 bytes) <- written LAST
+ *   IDX_B      @ 0x20000908  chunk index for buffer B       (4 bytes)
+ *   BUF_B      @ 0x2000090C  pixel data 128×8×2 B = 2048 B (2048 bytes)
+ *   TRIG_B     @ 0x2000110C  0xCC = buffer B ready          (4 bytes) <- written LAST
  *
- * The PC sends a single write_memory(FAST_IDX_ADDR, 32, {idx <1024 words> 0xCC}).
- * FAST_TRIG is the last word written, so the MCU cannot act before the full
- * chunk is resident in SRAM.
+ * PC sends a 2056-byte packet [IDX(4)][BUF(2048)][TRIG(4)] per buffer.
+ * TRIG is the last word written so MCU cannot fire before BUF is ready.
+ * MCU polls both TRIG_A and TRIG_B in a tight loop, drawing whichever fires.
+ * With 1.4 ms MCU draw time vs ~22 ms PC write time, no explicit handshake needed.
+ *
+ * Stack: 0x20002000 (top) down — ~3824 B available.
  */
 
 #include "n32g031.h"
@@ -24,19 +31,26 @@
 #include "system.h"
 #include "battery.h"
 
-/* Protocol SRAM addresses */
-#define CTRL      ((volatile uint32_t *)0x20000010UL)
-#define FAST_IDX  ((volatile uint32_t *)0x20000100UL)
-#define FAST_BUF  ((const uint16_t     *)0x20000104UL)
-#define FAST_TRIG ((volatile uint32_t *)0x20001104UL)
+/* Legacy control word */
+#define CTRL  ((volatile uint32_t *)0x20000010UL)
+
+/* Buffer A */
+#define IDX_A  ((volatile uint32_t *)0x20000100UL)
+#define BUF_A  ((const uint16_t     *)0x20000104UL)
+#define TRIG_A ((volatile uint32_t *)0x20000904UL)
+
+/* Buffer B */
+#define IDX_B  ((volatile uint32_t *)0x20000908UL)
+#define BUF_B  ((const uint16_t     *)0x2000090CUL)
+#define TRIG_B ((volatile uint32_t *)0x2000110CUL)
 
 #define CTRL_IDLE  0x00000000UL
 #define CTRL_CHUNK 0x000000CCUL
 #define CTRL_RESET 0xDEAD0000UL
 #define CTRL_SLEEP 0xDEAD0001UL
 
-#define CHUNK_ROWS 16u
-#define NUM_CHUNKS 10u
+#define CHUNK_ROWS  8u
+#define NUM_CHUNKS 20u
 
 /* draw_waiting — shown at startup while waiting for the PC to start streaming.
  * Fills the entire screen bright magenta so it is unmistakable; overlays three
@@ -71,21 +85,23 @@ int main(void)
     }
 
     /* ── Core hardware init (identical to flappy.c) ─────────────────────── */
-    clock_init();          /* 8 MHz HSI, TIM3 PSC=7 → 1 ms ticks             */
+    clock_init();              /* 8 MHz HSI, TIM3 PSC=7 → 1 ms ticks         */
+    clock_boost_48mhz();       /* PLL: 8→48 MHz; updates TIM3 PSC; SPI→24 MHz*/
     delay_ms(50);
-    display_init();        /* 4 MHz SPI — same as flappy, guaranteed to work  */
+    display_init();            /* 24 MHz SPI — 128×8 chunk blits in ~1.4 ms  */
     display_set_backlight(80);
     tim1_init();
     bat_init();            /* ADC init — included because flappy includes it  */
 
     /* ── Init protocol SRAM ─────────────────────────────────────────────── */
-    *CTRL      = CTRL_IDLE;
-    *FAST_TRIG = CTRL_IDLE;
+    *CTRL   = CTRL_IDLE;
+    *TRIG_A = CTRL_IDLE;
+    *TRIG_B = CTRL_IDLE;
 
     /* Show startup screen while waiting for the PC to connect */
     draw_waiting();
 
-    /* ── Streaming loop ──────────────────────────────────────────────────── */
+    /* ── Streaming loop (double-buffer ping-pong) ────────────────────────── */
     while (1) {
         IWDG_FEED();
 
@@ -98,23 +114,34 @@ int main(void)
 
         /* PC writes CTRL_RESET → re-init display (e.g. after power glitch) */
         if (*CTRL == CTRL_RESET) {
-            *CTRL      = CTRL_IDLE;
-            *FAST_TRIG = CTRL_IDLE;
+            *CTRL   = CTRL_IDLE;
+            *TRIG_A = CTRL_IDLE;
+            *TRIG_B = CTRL_IDLE;
             display_init();
             display_set_backlight(80);
             draw_waiting();
             continue;
         }
 
-        /* Main path: PC has written IDX + BUF, then set TRIG via mww.
-         * Read IDX and BUF immediately — no slow operations before reading them. */
-        if (*FAST_TRIG == CTRL_CHUNK) {
-            uint32_t idx = *FAST_IDX;
+        /* Buffer A: PC has written IDX_A + BUF_A then set TRIG_A last.
+         * MCU reads IDX and blits BUF_A to the correct screen row. */
+        if (*TRIG_A == CTRL_CHUNK) {
+            uint32_t idx = *IDX_A;
             if (idx < NUM_CHUNKS) {
                 uint16_t row_start = (uint16_t)(idx * CHUNK_ROWS);
-                display_draw_chunk_cpu(FAST_BUF, row_start, CHUNK_ROWS);
+                display_draw_chunk_cpu(BUF_A, row_start, CHUNK_ROWS);
             }
-            *FAST_TRIG = CTRL_IDLE;
+            *TRIG_A = CTRL_IDLE;
+        }
+
+        /* Buffer B: identical, independent of A. */
+        if (*TRIG_B == CTRL_CHUNK) {
+            uint32_t idx = *IDX_B;
+            if (idx < NUM_CHUNKS) {
+                uint16_t row_start = (uint16_t)(idx * CHUNK_ROWS);
+                display_draw_chunk_cpu(BUF_B, row_start, CHUNK_ROWS);
+            }
+            *TRIG_B = CTRL_IDLE;
         }
     }
 }

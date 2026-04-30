@@ -21,18 +21,21 @@ Usage examples:
     python stream_frames.py --halt
 
 Protocol (see streamer.c for MCU side):
-    Fast streaming layout — one write_memory per chunk:
+    Double-buffer layout — two independent 128x8 ping-pong buffers:
 
-    FAST_IDX  @ 0x20000100   chunk index 0–9
-    FAST_BUF  @ 0x20000104   4096 bytes of pixel data (128×16 px, BGR565 LE)
-    FAST_TRIG @ 0x20001104   0xCC written LAST — MCU blits chunk, clears to 0
+    CTRL   @ 0x20000010   0xDEAD0001 = halt, 0xDEAD0000 = reset
 
-    OpenOCD write_memory 0x20000100 32 {idx <1024 words> 0xCC}
-    FAST_TRIG is the final word — MCU cannot fire before BUF is fully written.
+    IDX_A  @ 0x20000100   chunk index 0-19
+    BUF_A  @ 0x20000104   2048 bytes pixel data (128x8 px, BGR565 LE)
+    TRIG_A @ 0x20000904   0xCC written LAST — MCU blits A, clears to 0
 
-    Legacy CTRL @ 0x20000010:
-        0xDEAD0000 = reset display
-        0xDEAD0001 = sleep display + idle loop (for halt)
+    IDX_B  @ 0x20000908   chunk index 0-19
+    BUF_B  @ 0x2000090C   2048 bytes pixel data (128x8 px, BGR565 LE)
+    TRIG_B @ 0x2000110C   0xCC written LAST — MCU blits B, clears to 0
+
+    PC alternates dirty chunks between A and B.  MCU polls both TRIGs in a
+    tight loop; with PLL boost (24 MHz SPI) each 128x8 chunk blits in ~1.4 ms,
+    well under the ~22 ms PC write time — no explicit handshake needed.
 """
 
 import argparse
@@ -58,26 +61,31 @@ except ImportError:
     HAS_MSS = False
 
 # ── Protocol ──────────────────────────────────────────────────────────────────
-FAST_IDX_ADDR  = 0x20000100
-FAST_BUF_ADDR  = 0x20000104   # IDX(4) + 4096 bytes of pixel data
-FAST_TRIG_ADDR = 0x20001104   # IDX(4) + BUF(4096) bytes past FAST_IDX_ADDR
-CTRL_ADDR      = 0x20000010   # legacy: reset / sleep
+CTRL_ADDR  = 0x20000010   # legacy: reset / sleep
 
-# Chunk BUF is written as a raw binary file then loaded via OpenOCD load_image.
-# This avoids the telnet text-command limit (~230 words / 2559 chars) and is faster
-# than six separate write_memory hex-text commands.
-# The Windows path is used by Python; the /mnt/c/ path by OpenOCD in WSL.
-_STREAMER_DIR  = os.path.dirname(os.path.abspath(__file__))
-CHUNK_BIN_WIN  = os.path.join(_STREAMER_DIR, 'chunk_buf.bin')
-CHUNK_BIN_WSL  = '/mnt/c/' + CHUNK_BIN_WIN.replace('\\', '/').replace('C:/', '').replace('c:/', '')
+# Double-buffer A
+BUF_A_IDX_ADDR  = 0x20000100
+BUF_A_DATA_ADDR = 0x20000104   # IDX_A(4) + 2048 bytes pixel data
+BUF_A_TRIG_ADDR = 0x20000904   # IDX_A(4) + BUF_A(2048) past BUF_A_IDX_ADDR
+
+# Double-buffer B
+BUF_B_IDX_ADDR  = 0x20000908
+BUF_B_DATA_ADDR = 0x2000090C   # IDX_B(4) + 2048 bytes pixel data
+BUF_B_TRIG_ADDR = 0x2000110C   # IDX_B(4) + BUF_B(2048) past BUF_B_IDX_ADDR
+
+# Combined packet sizes:
+#   Packet A: IDX_A(4) + BUF_A(2048) + TRIG_A(4) = 2056 B  @ BUF_A_IDX_ADDR
+#   Packet B: IDX_B(4) + BUF_B(2048) + TRIG_B(4) = 2056 B  @ BUF_B_IDX_ADDR
+BUF_CHUNK_BYTES = 2048    # pixel bytes per chunk (128 x 8 x 2)
+FULL_PACKET     = 2056    # IDX(4) + BUF(2048) + TRIG(4)
 
 CTRL_IDLE  = 0x00000000
 CTRL_CHUNK = 0x000000CC
 CTRL_RESET = 0xDEAD0000
 CTRL_SLEEP = 0xDEAD0001
 
-CHUNK_ROWS = 16
-NUM_CHUNKS = 10
+CHUNK_ROWS = 8
+NUM_CHUNKS = 20
 LCD_W, LCD_H = 128, 160
 
 # ── OpenOCD / WSL config ──────────────────────────────────────────────────────
@@ -95,7 +103,7 @@ OCD_TELNET_PORT = 4444
 
 # ── Color conversion ──────────────────────────────────────────────────────────
 def image_to_chunks(img):
-    """Convert any PIL Image → 10 raw chunk byte-strings (4096 B each, BGR565 LE)."""
+    """Convert any PIL Image → 20 raw chunk byte-strings (2048 B each, BGR565 LE)."""
     img = img.convert("RGB").resize((LCD_W, LCD_H), Image.LANCZOS)
     data = img.tobytes()
 
@@ -137,13 +145,22 @@ class VapeDisplay:
     # native filesystem.  Reading /tmp from WSL is instant (tmpfs); reading
     # /mnt/c/ (Windows filesystem) adds ~50 ms of cross-FS overhead per chunk.
     #
-    # The file is 4104 bytes: [IDX(4)] [BUF(4096)] [TRIG(4)]
-    # Written in one load_image to 0x20000100, so TRIG is the LAST word written —
-    # the MCU cannot fire until BUF is fully resident in SRAM.
+    # For full packets: 2056 bytes [IDX(4)][BUF(2048)][TRIG(4)].
+    # For sparse writes: variable size, one range at a time.
+    # The file is overwritten for each range; prompts are collected between writes
+    # to ensure OpenOCD has read the file before we clobber it.
     _WSL_CHUNK_PATH = '/tmp/vape_chunk.bin'
 
     def __init__(self, freq=4000000):
-        self._prev_chunks = [None] * NUM_CHUNKS
+        # Per-buffer previous-frame tracking for trimmed/sparse writes.
+        # _prev_A[i] = bytes last written to BUF_A for chunk index i (or None).
+        # _prev_B[i] = bytes last written to BUF_B for chunk index i (or None).
+        # We alternate A/B for consecutive dirty chunks each frame; knowing which
+        # buffer a chunk index last occupied lets us diff against the correct SRAM
+        # content so partial writes leave the correct pixels in the other region.
+        self._prev_A = [None] * NUM_CHUNKS
+        self._prev_B = [None] * NUM_CHUNKS
+        self._buf_toggle = False   # False → next dirty chunk goes to A; True → B
         self._freq_khz = freq // 1000
         self._sock = None
         self._ocd_proc = None
@@ -326,103 +343,152 @@ class VapeDisplay:
         self._wsl_writer.stdin.flush()
         self._wsl_writer.stdout.readline()   # block until sidecar acks
 
-    def _send_chunk(self, idx, chunk, prev_chunk=None):
-        """Write one chunk to the MCU, sending only the changed byte range.
+    @staticmethod
+    def _compute_ranges(chunk, prev_chunk, gap_thr=180):
+        """Return list of (start, end) dirty byte ranges, merging gaps <= gap_thr bytes.
 
-        If prev_chunk is provided, trims unchanged leading/trailing words to
-        reduce the load_image payload.  Only writes the region [trim_start,
-        trim_end) within FAST_BUF rather than all 4096 bytes.
+        Scans word-by-word (4 bytes).  Contiguous or near-contiguous dirty words
+        are merged into a single range if the gap between them is <= gap_thr bytes.
 
-        Break-even analysis: trimmed path adds ~4 ms overhead (two extra mww
-        round-trips for IDX and TRIG instead of the combined packet).  The
-        trimmed path is only taken when the partial payload is small enough
-        that the USB transfer savings outweigh that overhead (~3731 bytes).
-
-        SRAM layout (contiguous):
-          0x20000100  FAST_IDX  (4 bytes)
-          0x20000104  FAST_BUF  (4096 bytes)
-          0x20001104  FAST_TRIG (4 bytes)  ← written LAST; MCU fires only after BUF ready
+        Break-even for splitting vs merging one gap:
+            USB throughput ~91 KB/s; one extra load_image round-trip ~2 ms.
+            2 ms x 91 KB/s = 182 bytes — so merging gaps <= 180 bytes saves a
+            round-trip's worth of overhead.
         """
-        WORD = 4  # alignment for SWD bulk writes
+        WORD = 4
+        n = len(chunk)
+        ranges = []
+        cur_start = None
+        last_end  = 0
+        for i in range(0, n, WORD):
+            if chunk[i:i+WORD] != prev_chunk[i:i+WORD]:
+                if cur_start is None:
+                    cur_start = i
+                    last_end  = i + WORD
+                elif i - last_end <= gap_thr:
+                    last_end = i + WORD   # extend current range through the gap
+                else:
+                    ranges.append((cur_start, last_end))
+                    cur_start = i
+                    last_end  = i + WORD
+        if cur_start is not None:
+            ranges.append((cur_start, last_end))
+        return ranges
 
-        # ── Compute changed range ─────────────────────────────────────────────
+    def _send_chunk(self, idx, chunk, buf_idx_addr, buf_data_addr, buf_trig_addr,
+                    prev_chunk=None):
+        """Write one chunk to a specific MCU buffer (A or B).
+
+        Uses multi-range sparse writes: computes N contiguous dirty runs (merging
+        gaps <= 180 bytes), sends each as a separate load_image.  Falls back to a
+        single combined [IDX+BUF+TRIG] packet when total dirty data is large enough
+        that the USB transfer dominates and round-trip count doesn't matter.
+
+        The combined packet layout:
+          buf_idx_addr + 0:     IDX  (4 bytes)
+          buf_idx_addr + 4:     BUF  (2048 bytes)
+          buf_idx_addr + 2052:  TRIG (4 bytes) <- written LAST; MCU fires after BUF ready
+
+        For sparse writes: mww IDX is pipelined ahead of the first load_image;
+        each load_image prompt is collected before overwriting the shared tmp file
+        for the next range; mww TRIG is sent last.
+
+        With PLL boost (24 MHz SPI) MCU draw time is ~1.4 ms per 128x8 chunk,
+        well below the minimum ~2 ms PC write time, so no wait_trig_clear needed.
+        """
+        # ── Compute dirty ranges ──────────────────────────────────────────────
         if prev_chunk is not None and len(prev_chunk) == len(chunk):
-            n = len(chunk)
-            trim_start = n   # will hold first changed word start
-            trim_end   = 0   # will hold last  changed word end
-            for i in range(0, n, WORD):
-                if chunk[i:i+WORD] != prev_chunk[i:i+WORD]:
-                    if trim_start == n:
-                        trim_start = i
-                    trim_end = i + WORD
-            if trim_start == n:
-                return  # no change (shouldn't reach here in send_frame)
+            ranges = self._compute_ranges(chunk, prev_chunk)
+            if not ranges:
+                return   # chunk identical — nothing to send
         else:
-            trim_start, trim_end = 0, len(chunk)
+            ranges = [(0, len(chunk))]   # full write (no previous data in this buffer)
 
-        partial_len = trim_end - trim_start
+        total_dirty = sum(e - s for s, e in ranges)
 
-        # ── Choose write path ─────────────────────────────────────────────────
-        # Break-even: trimmed path costs +4 ms (two extra mww round-trips).
-        # Measured USB throughput: ~91 KB/s.  4 ms = ~364 bytes saved.
-        # Use trimmed path only when partial_len < full_len − 364 bytes.
-        FULL_PACKET = 4104  # IDX(4) + BUF(4096) + TRIG(4)
-        USE_TRIM = (partial_len < FULL_PACKET - 364)
-
-        if USE_TRIM:
-            # Partial write: write only the changed region of FAST_BUF, then
-            # set IDX and TRIG via separate mww commands.
-            # FAST_BUF already holds the previous full chunk for this idx;
-            # writing only the delta leaves unchanged pixels intact. ✓
-            partial = chunk[trim_start:trim_end]
-            self._sidecar_write(partial)
-            buf_addr = FAST_BUF_ADDR + trim_start
-            cmds = [
-                f'mww 0x{FAST_IDX_ADDR:08X} 0x{idx:08X}\n',
-                f'load_image {self._WSL_CHUNK_PATH} 0x{buf_addr:08X} bin\n',
-                f'mww 0x{FAST_TRIG_ADDR:08X} 0x{CTRL_CHUNK:08X}\n',
-            ]
-            for c in cmds:
-                self._sock.sendall(c.encode())
-            for _ in cmds:
-                self._read_prompt()
-        else:
-            # Full combined write: [IDX(4)][BUF(4096)][TRIG(4)] in one load_image.
-            # TRIG is the last word written → MCU cannot fire before BUF is ready.
+        # ── Full combined packet ──────────────────────────────────────────────
+        # Break-even: sparse path adds 2 extra mww round-trips (~4 ms = ~364 B).
+        # Use combined packet when dirty bytes exceed FULL_PACKET - 364.
+        if total_dirty >= FULL_PACKET - 364:
             packet = struct.pack('<I', idx) + chunk + struct.pack('<I', CTRL_CHUNK)
             self._sidecar_write(packet)
             self._sock.sendall(
-                f'load_image {self._WSL_CHUNK_PATH} 0x{FAST_IDX_ADDR:08X} bin\n'.encode()
+                f'load_image {self._WSL_CHUNK_PATH} 0x{buf_idx_addr:08X} bin\n'.encode()
             )
             self._read_prompt()
+            return
 
-    def _wait_trig_clear(self):
-        """Poll FAST_TRIG until the MCU clears it (finished drawing the chunk).
+        # ── Multi-range sparse write ──────────────────────────────────────────
+        # Pipeline mww IDX (no file) immediately; for each range write the file
+        # and send load_image, collecting the prompt before overwriting the file
+        # for the next range (ensures OpenOCD reads the correct data).
+        # Finally pipeline mww TRIG.
+        self._sock.sendall(f'mww 0x{buf_idx_addr:08X} 0x{idx:08X}\n'.encode())
+        pending = 1   # mww IDX
 
-        After TRIG=0xCC the MCU does a SPI blit (~8 ms at 4 MHz SPI).
-        We must not overwrite FAST_BUF until the MCU finishes reading it.
-        One mrw round-trip is usually enough — prompt collection already
-        takes ~10-15 ms, by which time the MCU has typically already cleared.
-        """
-        deadline = time.monotonic() + 0.080
-        while time.monotonic() < deadline:
-            resp = self._cmd(f'mrw 0x{FAST_TRIG_ADDR:08X}')
-            if '0xcc' not in resp.lower():
-                return
+        for i, (s, e) in enumerate(ranges):
+            self._sidecar_write(chunk[s:e])
+            self._sock.sendall(
+                f'load_image {self._WSL_CHUNK_PATH} 0x{buf_data_addr + s:08X} bin\n'.encode()
+            )
+            pending += 1
+            if i < len(ranges) - 1:
+                # Drain all pending prompts before writing next range to the file.
+                # This guarantees OpenOCD has read the file for this range before
+                # we overwrite it.
+                while pending > 0:
+                    self._read_prompt()
+                    pending -= 1
+
+        # Send TRIG last — MCU will not fire until this word lands.
+        self._sock.sendall(
+            f'mww 0x{buf_trig_addr:08X} 0x{CTRL_CHUNK:08X}\n'.encode()
+        )
+        pending += 1
+        while pending > 0:
+            self._read_prompt()
+            pending -= 1
 
     def send_frame(self, chunks):
-        """Send all changed chunks. Returns (elapsed_seconds, chunks_sent)."""
+        """Send all changed chunks, alternating between buffer A and buffer B.
+
+        Dirty chunks alternate A/B each send.  MCU polls both TRIGs independently;
+        with PLL boost the MCU draws each 128x8 chunk in ~1.4 ms while the PC
+        takes ~22+ ms to write 2048 bytes — so the MCU is always done before we
+        revisit the same buffer, eliminating the need for _wait_trig_clear.
+
+        Per-buffer prev tracking (_prev_A / _prev_B) ensures sparse diffs are
+        computed against the SRAM content of whichever buffer we're targeting,
+        not against a stale single-buffer view.
+        """
         t0 = time.monotonic()
         chunks_sent = 0
 
+        # Build a fast "all prev" view for the skip check (either buffer holds
+        # a matching chunk → nothing has changed on screen for this slot).
         for idx, chunk in enumerate(chunks):
-            if chunk == self._prev_chunks[idx]:
+            pA = self._prev_A[idx]
+            pB = self._prev_B[idx]
+            # Skip if either buffer already has this content displayed
+            if chunk == pA or chunk == pB:
                 continue
-            prev = self._prev_chunks[idx]   # capture before overwriting
-            self._prev_chunks[idx] = chunk
-            self._send_chunk(idx, chunk, prev)
+
+            # Alternate between buffer A and buffer B
+            if not self._buf_toggle:
+                prev = pA
+                self._send_chunk(idx, chunk,
+                                 BUF_A_IDX_ADDR, BUF_A_DATA_ADDR, BUF_A_TRIG_ADDR,
+                                 prev)
+                self._prev_A[idx] = chunk
+            else:
+                prev = pB
+                self._send_chunk(idx, chunk,
+                                 BUF_B_IDX_ADDR, BUF_B_DATA_ADDR, BUF_B_TRIG_ADDR,
+                                 prev)
+                self._prev_B[idx] = chunk
+
+            self._buf_toggle = not self._buf_toggle
             chunks_sent += 1
-            self._wait_trig_clear()
 
         return time.monotonic() - t0, chunks_sent
 
@@ -436,7 +502,9 @@ class VapeDisplay:
     def reset_display(self):
         """Force MCU to re-init the GC9107 display."""
         self._cmd(f'mww 0x{CTRL_ADDR:08X} 0x{CTRL_RESET:08X}')
-        self._prev_chunks = [None] * NUM_CHUNKS
+        self._prev_A = [None] * NUM_CHUNKS
+        self._prev_B = [None] * NUM_CHUNKS
+        self._buf_toggle = False
 
     def close(self):
         try:
