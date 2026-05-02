@@ -39,12 +39,10 @@
  *
  * Build: compile with -DFLAPPY_BIRD; exclude main.c / tamagotchi.c / slots.c
  */
-#ifdef FLAPPY_BIRD
-
-#include "n32g031.h"
+#include "app.h"      /* framework: app_init/update/wake, button_*, nv_* */
 #include "display.h"
-#include "system.h"
 #include "battery.h"
+#include "system.h"
 
 
 /* ===================================================================
@@ -63,92 +61,11 @@
 #define COL_DEAD     0x001FU   /* red flash */
 
 /* ===================================================================
- * High-score NV storage  (last 1 KB flash page @ 0x0800FC00)
- *
- * Format: one 32-bit word.  High halfword = magic 0xFB1D.
- *         Low halfword = score (0-9999).
- * Flash is erased (0xFFFFFFFF) when blank; we detect that.
- *
- * N32G031 flash register layout (already in FLASH_TypeDef / FLASH_IF):
- *   KEYR  +0x04   CR bits: PG=0, PER=1, MER=2, STRT=6, LOCK=7
- *   SR    +0x0C   BSY=0
- *   CR    +0x10
- *   AR    +0x14   page address for erase
+ * High-score NV storage — uses the vaporware NV framework (nv.h).
+ * NV_KEY_HIGH_SCORE (key 2) is the pre-allocated key for FlappyVape.
+ * Read: nv_read(NV_KEY_HIGH_SCORE, 0)
+ * Write: nv_write(NV_KEY_HIGH_SCORE, score)
  * =================================================================== */
-#define HISC_ADDR   0x0800FC00UL  /* last 1 KB page of 64 KB flash */
-#define HISC_MAGIC  0xFB1DU
-
-/* High-score flash storage — write-forward, no-erase scheme.
- *
- * The 1 KB page holds 256 × 32-bit slots.  Each slot is either blank
- * (0xFFFFFFFF) or a valid record: high 16 bits = magic 0xFB1D, low 16 bits
- * = score.  New scores are appended to the first blank slot — no page erase
- * is ever needed because we only write 1→0 transitions.  On read we scan
- * all slots and return the maximum valid score.  Only when all 256 slots are
- * consumed do we erase; at 8 KB SRAM and a game that resets often, hitting
- * 256 lifetime high-score updates is extremely unlikely.
- *
- * This sidesteps the page-erase BSY hang and any write-protection issues
- * on the erase path entirely. */
-
-#define HISC_SLOTS  ((uint32_t)(1024U / 4U))   /* 256 words per 1 KB page */
-
-static uint32_t hisc_read(void)
-{
-    /* Scan backward — the last written slot is the current high score. */
-    volatile uint32_t *page = (volatile uint32_t *)HISC_ADDR;
-    for (int i = (int)HISC_SLOTS - 1; i >= 0; i--) {
-        uint32_t v = page[i];
-        if ((v >> 16) == HISC_MAGIC)
-            return v & 0xFFFFU;
-    }
-    return 0;
-}
-
-static void hisc_write(uint32_t score)
-{
-    if (score > 9999U) score = 9999U;
-
-    /* Find the first blank slot — scan until we find 0xFFFFFFFF. */
-    volatile uint32_t *page = (volatile uint32_t *)HISC_ADDR;
-    uint32_t slot = HISC_SLOTS;          /* sentinel = page full */
-    for (uint32_t i = 0; i < HISC_SLOTS; i++) {
-        if (page[i] == 0xFFFFFFFFUL) { slot = i; break; }
-    }
-
-    volatile FLASH_TypeDef *F = FLASH_IF;
-
-    if (slot == HISC_SLOTS) {
-        /* Page is full — erase it and use slot 0.
-         * BSY loops do NOT feed IWDG.  If the erase hangs the watchdog
-         * fires, restarting the game (acceptable: player pressed restart). */
-        F->KEYR = 0x45670123UL;
-        F->KEYR = 0xCDEF89ABUL;
-        if (F->CR & (1UL << 7)) return;      /* unlock failed — bail */
-        *(volatile uint32_t *)0x40003000UL = 0xAAAAUL;
-        F->CR = (1UL << 1); F->AR = HISC_ADDR; F->CR |= (1UL << 6);
-        while (F->SR & 1U);
-        F->SR  = 0x34U;
-        *(volatile uint32_t *)0x40003000UL = 0xAAAAUL;
-        slot = 0;
-    } else {
-        /* Normal path: just unlock for programming, no erase needed. */
-        F->KEYR = 0x45670123UL;
-        F->KEYR = 0xCDEF89ABUL;
-        if (F->CR & (1UL << 7)) return;      /* unlock failed — bail */
-        *(volatile uint32_t *)0x40003000UL = 0xAAAAUL;
-    }
-
-    /* Program the chosen slot — N32G031 requires a single 32-bit word write. */
-    uint32_t addr  = HISC_ADDR + slot * 4U;
-    uint32_t val   = ((uint32_t)HISC_MAGIC << 16) | (score & 0xFFFFU);
-    F->CR = (1UL << 0);                       /* PG */
-    *(volatile uint32_t *)addr = val;          /* 32-bit word write — mandatory on N32G031 */
-    while (F->SR & 1U);
-    F->SR  = 0x34U;
-
-    F->CR = (1UL << 7);                       /* lock */
-}
 
 /* ===================================================================
  * Battery — thresholds and raw reading via vaporware battery.h/battery.c
@@ -746,62 +663,6 @@ static void scene_draw(int bird_y, int32_t vel_fp, uint32_t score)
 }
 
 /* ===================================================================
- * Display sleep — backlight off, poll button, feed IWDG.
- * Returns once button is pressed and released.
- * =================================================================== */
-static void display_sleep(void)
-{
-    /* Save GPIO MODER before gc9107_sleep_in() modifies PB4. */
-    uint32_t saved_modera = GPIOA->MODER;
-    uint32_t saved_moderb = GPIOB->MODER;
-
-    /* Send LCD sleep commands (Display Off → Sleep In). */
-    gc9107_sleep_in();
-
-    /* Put EVERY GPIO pin into analog mode (MODER=11 = output buffer
-     * disconnected, pin truly high-Z).  This releases the backlight
-     * driver's enable/dim input so it can default to off, regardless
-     * of which physical pin is wired to it. */
-    GPIOA->MODER = 0xFFFFFFFFUL;
-    GPIOB->MODER = 0xFFFFFFFFUL;
-
-    /* Restore PA7 as digital input with pull-up so we can read the button. */
-    GPIOA->MODER &= ~(3UL << (7 * 2));   /* PA7 = input (00) */
-
-    /* Keep SWD pins (PA13=SWDIO, PA14=SWCK) in AF mode so the ST-Link
-     * can still connect and flash while the device is sleeping. */
-    GPIOA->MODER &= ~((3UL << (13 * 2)) | (3UL << (14 * 2)));
-    GPIOA->MODER |=   (2UL << (13 * 2)) | (2UL << (14 * 2));  /* AF */
-
-    /* Keep RST (PB6) driven HIGH — if it floats LOW the GC9107 gets a
-     * hardware reset that wipes all init registers, and Sleep Out alone
-     * cannot restore them.  ODR still holds the HIGH written at init. */
-    GPIOB->MODER &= ~(3UL << (6 * 2));
-    GPIOB->MODER |=  (1UL  << (6 * 2));  /* PB6 = output */
-    GPIOB->BSRR   =  (1UL  <<  6);       /* RST HIGH */
-
-    /* Keep CS (PA15) driven HIGH (deasserted) to prevent noise on the
-     * floating SPI lines from being clocked into the sleeping LCD. */
-    GPIOA->MODER &= ~(3UL << (15 * 2));
-    GPIOA->MODER |=  (1UL  << (15 * 2)); /* PA15 = output */
-    GPIOA->BSRR   =  (1UL  <<  15);      /* CS HIGH */
-
-    /* Wait for button press then release, feeding IWDG. */
-    while (GPIOA->IDR & (1u << 7))
-        *(volatile uint32_t *)0x40003000UL = 0xAAAAUL;
-    while (!(GPIOA->IDR & (1u << 7)))
-        *(volatile uint32_t *)0x40003000UL = 0xAAAAUL;
-
-    /* Restore GPIO configuration before talking to the LCD. */
-    GPIOA->MODER = saved_modera;
-    GPIOB->MODER = saved_moderb;
-
-    /* Wake LCD (Sleep Out + 120 ms + Display On) and restore backlight. */
-    gc9107_sleep_out();
-    gc9107_set_backlight(80);
-}
-
-/* ===================================================================
  * Game states
  * =================================================================== */
 #define ST_WAITING 0
@@ -809,261 +670,201 @@ static void display_sleep(void)
 #define ST_DEAD    2
 
 /* ===================================================================
- * main
+ * Persistent game state (globals — survives between app_update calls)
  * =================================================================== */
-int main(void)
+static uint32_t g_high_score;
+static uint8_t  g_state;
+static int32_t  g_bird_fp;
+static int32_t  g_vel_fp;
+static int      g_bird_y;
+static int      g_prev_y;
+static uint32_t g_score;
+static uint32_t g_prev_score;
+static uint32_t g_dead_hold;
+static uint32_t g_frame_ctr;
+static uint16_t g_phys_t;
+static uint8_t  g_new_hisc;   /* 1 = new high score reached, needs NV write */
+
+/* ===================================================================
+ * game_init_state — reset to the waiting screen and draw initial scene.
+ * Called from app_init() at startup and on hard-reset.
+ * =================================================================== */
+static void game_init_state(void)
 {
-    /* Start the IWDG (in case it is in software-start mode — writing 0xCCCC
-     * is harmless if hardware-start mode already has it running).
-     * Then immediately reload so the counter starts from the top. */
-    *(volatile uint32_t *)0x40003000UL = 0xCCCCUL;   /* start */
-    *(volatile uint32_t *)0x40003000UL = 0xAAAAUL;   /* reload */
+    g_seed ^= (g_frame_ctr * 2654435761UL) ^ 0xC0DE1234UL;
 
-    /* Coil safety: drive PA4, PA5, PA6 to output LOW before anything else.
-     *
-     * Why these pins: the confirmed coil gate on production Raz DC25000 is PB0
-     * (from Ghidra analysis of fw_dump.bin).  PA4/PA5/PA6 are NOT the coil on
-     * known boards, but unknown hardware variants or reworked boards might differ.
-     * Driving them LOW is a conservative safety measure with zero side-effects
-     * on production hardware.
-     *
-     * Register addresses used directly (before clock_init / n32g031.h structs):
-     *   0x40021018 = RCC->APB2ENR  — enable GPIOA clock (bit 2 = IOPAEN)
-     *   0x40010800 = GPIOA->MODER  — configure PA4,PA5,PA6 as outputs (MODER=01)
-     *   0x40010818 = GPIOA->BSRR   — BSRR bits[20:22] clear PA4/5/6 to LOW
-     *                                 (BSRR bits[16+n] = reset pin n)
-     */
-    {
-        volatile uint32_t *rcc  = (volatile uint32_t *)0x40021018UL; /* APB2ENR */
-        volatile uint32_t *modr = (volatile uint32_t *)0x40010800UL; /* GPIOA MODER */
-        volatile uint32_t *bsrr = (volatile uint32_t *)0x40010818UL; /* GPIOA BSRR */
-        *rcc  |= (1UL << 2);     /* IOPAEN: enable GPIOA clock */
-        (void)*modr;             /* dummy read to allow clock to propagate */
-        *modr &= ~((3UL<<8)|(3UL<<10)|(3UL<<12));  /* clear MODER for PA4,PA5,PA6 */
-        *modr |=  ((1UL<<8)|(1UL<<10)|(1UL<<12));  /* set PA4,PA5,PA6 = output */
-        *bsrr  =  (1UL<<20)|(1UL<<21)|(1UL<<22);   /* reset PA4,PA5,PA6 → LOW */
-    }
-
-    clock_init();
-    delay_ms(50);
-    display_init();
-    display_set_backlight(80);
-    tim1_init();
-    bat_init();
-
-    /* PA7 = button, active-low, pull-up */
-    GPIOA->MODER &= ~(3UL << (7*2));
-    GPIOA->PUPDR &= ~(3UL << (7*2));
-    GPIOA->PUPDR |=  (1UL << (7*2));
-
-    /* Load persistent high score from flash */
-    uint32_t high_score = hisc_read();
-
-    g_bat_raw = bat_read_raw();     /* initial battery reading */
-
-    gc9107_fill(0x0000U);           /* clear to black before game draws */
-
-    uint8_t  state;
-    int32_t  bird_fp, vel_fp;
-    int      bird_y, prev_y;
-    uint32_t score, prev_score;
-    uint8_t  btn_prev;
-    uint32_t dead_hold;
-    uint32_t frame_ctr;
-    uint16_t phys_t;
-    uint16_t last_active;   /* ms timestamp of last button press */
-    uint8_t  is_dimmed;     /* 1 = backlight already dimmed */
-    uint16_t btn_held_ms;   /* ms button continuously held (for hard reset) */
-    uint8_t  new_hisc;      /* 1 = high score beaten this round, needs flash write */
-
-    frame_ctr = 0;
-
-game_restart:
-    g_seed ^= (frame_ctr * 2654435761UL) ^ 0xC0DE1234UL;
-
-    state       = ST_WAITING;
-    bird_fp     = (int32_t)BIRD_START_Y << FP_SHIFT;
-    vel_fp      = 0;
-    bird_y      = BIRD_START_Y;
-    prev_y      = BIRD_START_Y;
-    score       = 0;
-    prev_score  = 0xFFFFFFFFUL;
-    btn_prev    = 1;
-    dead_hold   = 0;
-    is_dimmed   = 0;
-    btn_held_ms = 0;
-    new_hisc    = 0;
-    phys_t      = ms_now();
-    last_active = ms_now();
-    gc9107_set_backlight(80);
+    g_state      = ST_WAITING;
+    g_bird_fp    = (int32_t)BIRD_START_Y << FP_SHIFT;
+    g_vel_fp     = 0;
+    g_bird_y     = BIRD_START_Y;
+    g_prev_y     = BIRD_START_Y;
+    g_score      = 0;
+    g_prev_score = 0xFFFFFFFFUL;
+    g_dead_hold  = 0;
+    g_new_hisc   = 0;
+    g_phys_t     = ms_now();
 
     pipe_reset(0, (int16_t)(PIPE_START_X));
     pipe_reset(1, (int16_t)(PIPE_START_X + PIPE_SEP));
 
-    scene_draw(bird_y, vel_fp, 0);
+    scene_draw(g_bird_y, g_vel_fp, 0);
     draw_waiting_hint();
-    prev_score = 0;
+    g_prev_score = 0;
+}
 
-    while (1)
-    {
-        *(volatile uint32_t *)0x40003000UL = 0xAAAAUL;  /* IWDG */
+/* ===================================================================
+ * on_hard_reset — framework hold-to-reset callback (10 s hold)
+ * =================================================================== */
+static void on_hard_reset(void)
+{
+    if (g_new_hisc) {
+        nv_write(NV_KEY_HIGH_SCORE, g_high_score);
+        g_new_hisc = 0;
+    }
+    game_init_state();
+}
 
-        /* ---- Inactivity dim / sleep ---- */
-        /* Only apply during WAITING or DEAD — never dim mid-game. During play,
-         * immediately restore full brightness if it was previously dimmed. */
-        {
-            if (state == ST_PLAYING) {
-                if (is_dimmed) { gc9107_set_backlight(80); is_dimmed = 0; }
-            } else {
-                uint16_t sleep_ms = (g_bat_raw < BAT_CRIT) ? 3000u : (uint16_t)SLEEP_MS;
-                uint16_t dim_ms   = (g_bat_raw < BAT_CRIT) ? 1000u : (uint16_t)DIM_MS;
-                uint16_t idle = (uint16_t)(ms_now() - last_active);
-                if (idle >= sleep_ms) {
-                    display_sleep();        /* backlight off; wait button wake */
-                    last_active = ms_now();
-                    is_dimmed   = 0;
-                    scene_draw(bird_y, vel_fp, score);
-                    if (state == ST_DEAD)
-                        draw_death_overlay(score, high_score, score >= 10u);
-                    phys_t   = ms_now();
-                    btn_prev = 1;
-                    continue;
-                } else if (idle >= dim_ms) {
-                    if (!is_dimmed) { gc9107_set_backlight(15); is_dimmed = 1; }
-                } else {
-                    if (is_dimmed) { gc9107_set_backlight(80); is_dimmed = 0; }
-                }
-            }
-        }
+/* ===================================================================
+ * app_init — called once by the framework after all hardware is up
+ * =================================================================== */
+void app_init(void)
+{
+    app_set_sleep_timeout(12000);          /* sleep after 12 s idle  */
+    app_set_hold_reset(10000, on_hard_reset); /* hold 10 s → reset    */
 
-        /* ---- Physics tick gate ---- */
-        uint16_t now = ms_now();
-        if ((uint16_t)(now - phys_t) < PHYS_MS) continue;
-        phys_t += (uint16_t)PHYS_MS;
-        frame_ctr++;
+    g_high_score = nv_read(NV_KEY_HIGH_SCORE, 0);
+    g_bat_raw    = bat_read_raw();
+    g_frame_ctr  = 0;
 
-        /* Battery read every 625 frames (~5 s at 125 Hz) */
-        if (frame_ctr % 625u == 0u) {
-            g_bat_raw = bat_read_raw();
-            draw_bat();
-            /* Force sleep immediately if critically low */
-            if (g_bat_raw < BAT_CRIT) {
-                display_sleep();
-                last_active = ms_now();
-                is_dimmed   = 0;
-                scene_draw(bird_y, vel_fp, score);
-                if (state == ST_DEAD)
-                    draw_death_overlay(score, high_score, score >= 10u);
-                phys_t   = ms_now();
-                btn_prev = 1;
-                continue;
-            }
-        }
+    display_fill(0x0000);
+    game_init_state();
+}
 
-        /* Button edge detect + held-down hard-reset (10 s) */
-        uint8_t btn  = (uint8_t)((GPIOA->IDR >> 7) & 1u);
-        uint8_t flap = (btn == 0u && btn_prev == 1u);
-        btn_prev = btn;
-        if (flap) { last_active = ms_now(); btn_held_ms = 0; }
-        if (btn == 0u) {                         /* button held */
-            btn_held_ms += PHYS_MS;
-            if (btn_held_ms >= 10000u) goto game_restart;  /* hard reset */
-        } else {
-            btn_held_ms = 0;
-        }
-        if (flap) last_active = ms_now();
+/* ===================================================================
+ * app_update — called every ~33 ms by the framework (~30 fps)
+ *
+ * Physics runs at PHYS_MS=8 ms (125 Hz).  We catch up by running as
+ * many 8ms ticks as have elapsed since the last call — typically 4
+ * ticks per frame.  button_just_pressed() is latched once per frame
+ * and consumed on the first physics tick that handles it.
+ * =================================================================== */
+void app_update(uint32_t frame)
+{
+    (void)frame;
+
+    /* Battery read every ~150 app frames (~5 s at 30 fps) */
+    g_frame_ctr++;
+    if (g_frame_ctr % 150u == 0u) {
+        g_bat_raw = bat_read_raw();
+        draw_bat();
+    }
+
+    /* Latch button edge once per frame — consumed in first tick that needs it */
+    uint8_t flap = button_just_pressed();
+
+    /* Run physics catch-up: process all pending 8ms ticks */
+    while ((uint16_t)(ms_now() - g_phys_t) >= PHYS_MS) {
+        g_phys_t += PHYS_MS;
 
         /* ---- Waiting ---- */
-        if (state == ST_WAITING) {
+        if (g_state == ST_WAITING) {
             if (flap) {
-                state = ST_PLAYING;
-                vel_fp = FLAP_FP;
-                scene_draw(bird_y, vel_fp, score); /* wipe hint */
+                g_state  = ST_PLAYING;
+                g_vel_fp = FLAP_FP;
+                scene_draw(g_bird_y, g_vel_fp, g_score); /* wipe hint */
+                flap = 0;
             }
             continue;
         }
 
         /* ---- Dead ---- */
-        if (state == ST_DEAD) {
-            if (++dead_hold > 15u && flap) {
-                /* Write new high score to flash now, right before restart.
-                 * If the flash erase hangs and the IWDG fires, the device
-                 * resets — which just restarts the game sooner. Acceptable. */
-                if (new_hisc) hisc_write(high_score);
-                goto game_restart;
+        if (g_state == ST_DEAD) {
+            if (++g_dead_hold > 15u && flap) {
+                if (g_new_hisc) {
+                    nv_write(NV_KEY_HIGH_SCORE, g_high_score);
+                    g_new_hisc = 0;
+                }
+                game_init_state();
+                return;   /* g_phys_t was reset; skip remaining ticks */
             }
             continue;
         }
 
-        /* ==============================================================
-         * PLAYING — physics + differential render
-         * ============================================================== */
+        /* ---- Playing — physics + differential render ---- */
+        if (flap) { g_vel_fp = FLAP_FP; flap = 0; }
+        g_vel_fp += GRAVITY_FP;
+        if (g_vel_fp > MAX_FALL_FP) g_vel_fp = MAX_FALL_FP;
+        g_bird_fp += g_vel_fp;
 
-        if (flap) vel_fp = FLAP_FP;
-        vel_fp += GRAVITY_FP;
-        if (vel_fp > MAX_FALL_FP) vel_fp = MAX_FALL_FP;
-        bird_fp += vel_fp;
-
-        if (bird_fp < ((int32_t)PIPE_TOP << FP_SHIFT)) {
-            bird_fp = (int32_t)PIPE_TOP << FP_SHIFT; vel_fp = 0;
+        if (g_bird_fp < ((int32_t)PIPE_TOP << FP_SHIFT)) {
+            g_bird_fp = (int32_t)PIPE_TOP << FP_SHIFT;
+            g_vel_fp  = 0;
         }
-        int ny = (int)(bird_fp >> FP_SHIFT);
-        if (ny + BIRD_H >= GROUND_Y) { ny = GROUND_Y - BIRD_H; state = ST_DEAD; }
+        int ny = (int)(g_bird_fp >> FP_SHIFT);
+        if (ny + BIRD_H >= GROUND_Y) {
+            ny       = GROUND_Y - BIRD_H;
+            g_state  = ST_DEAD;
+        }
 
         /* Pipe scroll */
         for (int i = 0; i < PIPE_COUNT; i++) {
             if (pipe_scroll(&g_pipes[i]))
-                pipe_reset(i, (int16_t)((int)g_pipes[i^1].x + PIPE_SEP));
+                pipe_reset(i, (int16_t)((int)g_pipes[i ^ 1].x + PIPE_SEP));
             if (!g_pipes[i].scored && (int)g_pipes[i].x + PIPE_W < BIRD_X) {
-                g_pipes[i].scored = 1; score++;
+                g_pipes[i].scored = 1;
+                g_score++;
             }
         }
 
         /* Collision */
-        if (state == ST_PLAYING)
+        if (g_state == ST_PLAYING)
             for (int i = 0; i < PIPE_COUNT; i++)
-                if (hit_pipe(ny, &g_pipes[i])) { state = ST_DEAD; break; }
+                if (hit_pipe(ny, &g_pipes[i])) { g_state = ST_DEAD; break; }
 
-        /* Bird */
-        if (prev_y != ny) bird_erase(prev_y);
-        bird_render(ny, vel_fp);
-        prev_y = ny; bird_y = ny;
-        bird_fp = (int32_t)ny << FP_SHIFT;
+        /* Bird differential render */
+        if (g_prev_y != ny) bird_erase(g_prev_y);
+        bird_render(ny, g_vel_fp);
+        g_prev_y  = ny;
+        g_bird_y  = ny;
+        g_bird_fp = (int32_t)ny << FP_SHIFT;
 
         /* Score bar */
-        if (score != prev_score) { draw_score(score); prev_score = score; }
+        if (g_score != g_prev_score) {
+            draw_score(g_score);
+            g_prev_score = g_score;
+        }
 
         /* ---- On death: update high score in RAM, show overlay ---- */
-        if (state == ST_DEAD) {
-            /* Update RAM immediately so overlay shows correct high score.
-             * Flash write is deferred to restart (see ST_DEAD handler above). */
-            if (score > high_score) {
-                high_score = score;
-                new_hisc   = 1;
+        if (g_state == ST_DEAD) {
+            if (g_score > g_high_score) {
+                g_high_score = g_score;
+                g_new_hisc   = 1;
             }
 
-            *(volatile uint32_t *)0x40003000UL = 0xAAAAUL;
-            gc9107_fill(COL_DEAD);
-            /* IWDG-safe 80 ms red-flash delay */
-            {
-                uint16_t t0 = ms_now();
-                while ((uint16_t)(ms_now() - t0) < 80u)
-                    *(volatile uint32_t *)0x40003000UL = 0xAAAAUL;
-            }
-            *(volatile uint32_t *)0x40003000UL = 0xAAAAUL;
-            scene_draw(bird_y, vel_fp, score);
-            *(volatile uint32_t *)0x40003000UL = 0xAAAAUL;
-            draw_death_overlay(score, high_score, score >= 10u);
-            if (score >= 10u) {
-                *(volatile uint32_t *)0x40003000UL = 0xAAAAUL;
-            }
-            prev_score = score;
-            phys_t     = ms_now();
-            last_active = ms_now();         /* reset sleep timer on death */
+            /* Red screen flash — display_fill blocks ~50ms; feed IWDG before/after */
+            IWDG_FEED();
+            display_fill(COL_DEAD);
+            delay_ms(30);           /* extra red-flash time; delay_ms feeds IWDG */
+            IWDG_FEED();
+            scene_draw(g_bird_y, g_vel_fp, g_score);
+            IWDG_FEED();
+            draw_death_overlay(g_score, g_high_score, g_score >= 10u);
+            g_prev_score = g_score;
+            g_phys_t     = ms_now();
+            return;   /* g_phys_t reset; skip remaining ticks this frame */
         }
     }
-
-    return 0;
 }
 
-#endif /* FLAPPY_BIRD */
+/* ===================================================================
+ * app_wake — called by framework after device wakes from sleep
+ * =================================================================== */
+void app_wake(void)
+{
+    scene_draw(g_bird_y, g_vel_fp, g_score);
+    if (g_state == ST_DEAD)
+        draw_death_overlay(g_score, g_high_score, g_score >= 10u);
+    else if (g_state == ST_WAITING)
+        draw_waiting_hint();
+    g_phys_t = ms_now();   /* reset physics timer so no catch-up burst on wake */
+}
