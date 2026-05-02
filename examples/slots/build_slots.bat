@@ -1,4 +1,5 @@
 @echo off
+cd /d "%~dp0"
 :: build_slots.bat - Vaporware Slot Machine for N32G031 + GC9107 128x160 LCD
 
 set GCC="C:\Program Files (x86)\Arm GNU Toolchain arm-none-eabi\14.2 rel1\bin\arm-none-eabi-gcc.exe"

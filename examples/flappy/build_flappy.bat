@@ -1,4 +1,5 @@
 @echo off
+cd /d "%~dp0"
 :: Flappy Bird build for N32G031 + GC9107 128x160 LCD
 :: Uses vaporware shared library for display, system, battery, and vape drivers.
 :: Excludes main.c / tamagotchi.c - uses flappy.c instead

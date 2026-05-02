@@ -260,8 +260,10 @@ void display_draw_image(const uint16_t *img, uint16_t x, uint16_t y,
     uint32_t npix = (uint32_t)w * h;
     for (uint32_t i = 0; i < npix; i++) {
         uint16_t px = img[i];
-        while (!(SPI1->SR & SPI_SR_TXE)); *(volatile uint8_t *)&SPI1->DR = px >> 8;
-        while (!(SPI1->SR & SPI_SR_TXE)); *(volatile uint8_t *)&SPI1->DR = px & 0xFF;
+        while (!(SPI1->SR & SPI_SR_TXE));
+        *(volatile uint8_t *)&SPI1->DR = px >> 8;
+        while (!(SPI1->SR & SPI_SR_TXE));
+        *(volatile uint8_t *)&SPI1->DR = px & 0xFF;
     }
     while (SPI1->SR & SPI_SR_BSY);
     LCD_CS_HIGH();

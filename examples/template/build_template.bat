@@ -1,4 +1,5 @@
 @echo off
+cd /d "%~dp0"
 :: build_template.bat - Vaporware SDK template app build script
 ::
 :: HOW TO USE THIS TEMPLATE
