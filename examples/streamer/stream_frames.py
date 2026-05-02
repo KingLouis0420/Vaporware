@@ -89,6 +89,12 @@ BUF_B_TRIG_ADDR = 0x2000090C   # IDX_B(4) + BUF_B(1024) past BUF_B_IDX_ADDR
 BUF_CHUNK_BYTES = 1024    # pixel bytes per chunk (64 x 8 x 2)
 FULL_PACKET     = 1032    # IDX(4) + BUF(1024) + TRIG(4)
 
+# At 4 MHz SPI each 128×16 blit = 4096 bytes = 8.19 ms.
+# Worst-case MCU latency before starting a draw: up to 8 ms (if it is mid-draw
+# on the *other* buffer when we set TRIG).  Total safe window = 8 + 8.2 + 0.3 = 16.5 ms.
+# send_frame() uses this as the threshold for skipping the poll-for-clear check.
+MCU_DRAW_S = 0.0165      # 16.5 ms worst-case: 8 ms MCU latency + 8.2 ms SPI + margin
+
 CTRL_IDLE  = 0x00000000
 CTRL_CHUNK = 0x000000CC
 CTRL_RESET = 0xDEAD0000
@@ -192,9 +198,16 @@ class VapeDisplay:
         # We alternate A/B for consecutive dirty chunks each frame; knowing which
         # buffer a chunk index last occupied lets us diff against the correct SRAM
         # content so partial writes leave the correct pixels in the other region.
-        self._prev_A = [None] * NUM_CHUNKS
-        self._prev_B = [None] * NUM_CHUNKS
+        self._prev_A = [None] * NUM_CHUNKS   # bytes in SRAM buffer A for each chunk
+        self._prev_B = [None] * NUM_CHUNKS   # bytes in SRAM buffer B for each chunk
+        self._last_sent = [None] * NUM_CHUNKS # content last triggered → what display shows
         self._buf_toggle = False   # False → next dirty chunk goes to A; True → B
+        # Timestamps of the last TRIG write for each buffer.  Used to enforce the
+        # MCU_DRAW_S guard in send_frame(): we must not overwrite BUF_A/B while
+        # the MCU is still SPI-blitting from it.  Initialised to 0 so the first
+        # write to each buffer always proceeds without sleeping.
+        self._last_trig_A_time = 0.0
+        self._last_trig_B_time = 0.0
         self._freq_khz = freq // 1000
         self._sock = None
         self._ocd_proc = None
@@ -370,6 +383,21 @@ class VapeDisplay:
         self._sock.sendall((command + '\n').encode())
         return self._read_prompt()
 
+    def _wait_trig_clear(self, trig_addr, timeout_s=0.5):
+        """Poll TRIG via mrw until MCU clears it (it finished drawing from that buffer).
+
+        Fast path: returns on the first poll if TRIG is already 0 — cost is one
+        ~2 ms telnet round-trip.  Only spins when the timing guard says the MCU
+        might still be drawing (elapsed < MCU_DRAW_S).
+        """
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            resp = self._cmd(f'mrw 0x{trig_addr:08X}')
+            m = re.search(r'0x([0-9a-fA-F]+)', resp)
+            if m and int(m.group(1), 16) == 0:
+                return
+            time.sleep(0.001)
+
     def _sidecar_write(self, data):
         """Write variable-length binary data to the WSL sidecar (length-prefixed)."""
         self._wsl_writer.stdin.write(struct.pack('<I', len(data)))
@@ -427,8 +455,8 @@ class VapeDisplay:
         each load_image prompt is collected before overwriting the shared tmp file
         for the next range; mww TRIG is sent last.
 
-        With PLL boost (24 MHz SPI) MCU draw time is ~1.4 ms per 128x8 chunk,
-        well below the minimum ~2 ms PC write time, so no wait_trig_clear needed.
+        At 4 MHz SPI MCU draw time is ~8.2 ms per 128×16 chunk.  send_frame()
+        enforces a MCU_DRAW_S timing guard before each call so BUF is safe to write.
         """
         # ── Compute dirty ranges ──────────────────────────────────────────────
         if prev_chunk is not None and len(prev_chunk) == len(chunk):
@@ -486,41 +514,44 @@ class VapeDisplay:
     def send_frame(self, chunks):
         """Send all changed chunks, alternating between buffer A and buffer B.
 
-        Dirty chunks alternate A/B each send.  MCU polls both TRIGs independently;
-        with PLL boost the MCU draws each 128x8 chunk in ~1.4 ms while the PC
-        takes ~22+ ms to write 2048 bytes — so the MCU is always done before we
-        revisit the same buffer, eliminating the need for _wait_trig_clear.
+        TRIG POLL — before writing to a buffer, check elapsed time since its last
+        TRIG was set.  If < MCU_DRAW_S (16.5 ms worst-case = 8 ms MCU latency +
+        8.2 ms SPI blit), poll mrw until TRIG is 0 (MCU cleared it).  For typical
+        full-chunk writes (~11 ms inter-buffer gap) the poll returns in one round-
+        trip (~2 ms overhead); for sparse writes it may spin briefly.
 
-        Per-buffer prev tracking (_prev_A / _prev_B) ensures sparse diffs are
-        computed against the SRAM content of whichever buffer we're targeting,
-        not against a stale single-buffer view.
+        Per-buffer prev tracking (_prev_A / _prev_B) keeps sparse diffs against
+        the actual SRAM content of whichever buffer we're targeting.
+        _last_sent[ci] reflects what the display is SHOWING for image chunk ci.
         """
         t0 = time.monotonic()
         chunks_sent = 0
 
-        # Build a fast "all prev" view for the skip check (either buffer holds
-        # a matching chunk → nothing has changed on screen for this slot).
-        for idx, chunk in enumerate(chunks):
-            pA = self._prev_A[idx]
-            pB = self._prev_B[idx]
-            # Skip if either buffer already has this content displayed
-            if chunk == pA or chunk == pB:
+        for ci, chunk in enumerate(chunks):
+            # Skip if the display already shows this exact content for this slot.
+            if chunk == self._last_sent[ci]:
                 continue
 
-            # Alternate between buffer A and buffer B
             if not self._buf_toggle:
-                prev = pA
-                self._send_chunk(idx, chunk,
+                # Poll TRIG_A if timing doesn't guarantee MCU is done with it.
+                if time.monotonic() - self._last_trig_A_time < MCU_DRAW_S:
+                    self._wait_trig_clear(BUF_A_TRIG_ADDR)
+                self._send_chunk(ci, chunk,
                                  BUF_A_IDX_ADDR, BUF_A_DATA_ADDR, BUF_A_TRIG_ADDR,
-                                 prev)
-                self._prev_A[idx] = chunk
+                                 self._prev_A[ci])
+                self._last_trig_A_time = time.monotonic()
+                self._prev_A[ci] = chunk
             else:
-                prev = pB
-                self._send_chunk(idx, chunk,
+                # Poll TRIG_B if timing doesn't guarantee MCU is done with it.
+                if time.monotonic() - self._last_trig_B_time < MCU_DRAW_S:
+                    self._wait_trig_clear(BUF_B_TRIG_ADDR)
+                self._send_chunk(ci, chunk,
                                  BUF_B_IDX_ADDR, BUF_B_DATA_ADDR, BUF_B_TRIG_ADDR,
-                                 prev)
-                self._prev_B[idx] = chunk
+                                 self._prev_B[ci])
+                self._last_trig_B_time = time.monotonic()
+                self._prev_B[ci] = chunk
 
+            self._last_sent[ci] = chunk
             self._buf_toggle = not self._buf_toggle
             chunks_sent += 1
 
@@ -538,7 +569,10 @@ class VapeDisplay:
         self._cmd(f'mww 0x{CTRL_ADDR:08X} 0x{CTRL_RESET:08X}')
         self._prev_A = [None] * NUM_CHUNKS
         self._prev_B = [None] * NUM_CHUNKS
+        self._last_sent = [None] * NUM_CHUNKS
         self._buf_toggle = False
+        self._last_trig_A_time = 0.0
+        self._last_trig_B_time = 0.0
 
     def close(self):
         try:
