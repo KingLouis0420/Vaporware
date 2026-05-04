@@ -2,7 +2,7 @@
 
 ## Hardware
 
-- **MCU**: Nations Tech N32G031K8Q7-1 — ARM Cortex-M0 @ 48MHz, 64KB flash, 8KB SRAM
+- **MCU**: Nations Tech N32G031K8Q7-1 — ARM Cortex-M0, 64KB flash, 8KB SRAM; runs at **8 MHz HSI** in custom firmware (no PLL — low power/EMI). The original factory firmware may enable PLL to reach higher speeds.
 - **Display**: 128x160 IPS TFT, GC9107 controller (panel: CDI F17RN1048-1 / same as GC9107-Vape-lcd-Arduino-Library)
 - **External Flash**: GT25Q80A 8Mbit (1MB) SPI NOR Flash
 - **MCU GPIO base addresses**: GPIOA=0x40010800, GPIOB=0x40010C00, GPIOC=0x40011000
@@ -37,7 +37,7 @@ Note: SPI2 peripheral (0x40002800) is absent from all literal pool scans — fla
 ### Other Peripherals (partially confirmed from Ghidra)
 | Peripheral | Function            | Source              |
 |------------|---------------------|---------------------|
-| ADC1 (0x40012000) | Vape/mic detection | Referenced at 0x1D28, 0x2F2C, 0x34F8, 0x4BD8 |
+| ADC1 (0x40020800) | Vape/mic detection | Referenced at 0x1D28, 0x2F2C, 0x34F8, 0x4BD8; base confirmed via live OpenOCD AHBENR scan |
 | 0x40014400 | Unknown (COMP or ADC2) | Used alongside ADC1 in vape-detect path |
 | TIM3 (0x40000400) | Timing/PWM | Referenced at 0x3814, 0x5028 |
 | DAC  (0x40007000) | Possibly coil drive or backlight | Function at 0x42BC writes DAC_DHR12R1 |
@@ -45,8 +45,7 @@ Note: SPI2 peripheral (0x40002800) is absent from all literal pool scans — fla
 | USART2 (0x40003000)| Debug/comms | Referenced at 0x2FAC–0x2FD8 |
 | DMA1 (0x40020000) | SPI/ADC DMA | Referenced at 0x19A8, 0x5384 |
 
-**SAFETY**: Coil pin NOT confirmed — DAC PA4/PA5 is the prime suspect.
-Custom firmware leaves all non-LCD/non-flash GPIO pins as inputs (reset default), preventing inadvertent coil activation.
+**Coil gate**: **PB0** confirmed as the coil MOSFET gate (HIGH = coil on). PA4/PA5 are NOT the coil — they were ruled out by live toggling with IWDG monitoring. PB0 is shared with the battery ADC (channel 8); `bat_read_raw()` saves/restores MODER around conversions so both uses are safe to interleave.
 
 ## Key Firmware Functions
 

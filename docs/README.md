@@ -49,7 +49,7 @@ These are N32G031-specific and differ from STM32 values.
 | GPIOA | 0x40010800 | APB2ENR bit 2 |
 | GPIOB | 0x40010C00 | APB2ENR bit 3 |
 | SPI1 | 0x40012000 | APB2ENR bit 9 (NOT bit 12 like STM32F1) |
-| TIM1 | 0x40012C00 | APB2ENR bit 11 |
+| TIM1 | 0x40012C00 | APB2ENR bit 12 |
 | TIM3 | 0x40000400 | APB1ENR bit 1 |
 | ADC1 | 0x40020800 | AHBENR bit 12 (NOT APB2ENR) |
 | FLASH | 0x40022000 | — |
@@ -119,7 +119,7 @@ acts as natural debounce (mechanical bounce < 10ms).
 - `button_just_pressed()` — 1 on the frame the button goes down (one-shot)
 - `button_just_released()` — 1 on the frame the button is released (one-shot)
 - `button_held_ms()` — ms continuously held; saturates at 65535 ms
-- `button_raw()` — direct GPIO read, no state update
+- `button_raw()` — direct GPIO read, no state update; use this inside long render loops where `button_update()` is not being called
 
 ### `nv` — Write-Forward NV Flash Storage
 
@@ -232,7 +232,8 @@ Flash via OpenOCD + hla_swd (see flash workflow memory note for trampoline detai
 |---|---|
 | **SysTick absent** | Writes to SYST_CSR are silently discarded on this N32G031 variant. Use TIM3/TIM1 instead. Never use CMSIS `SysTick_Config()`. |
 | **ms_now() wraps at 65535** | TIM1 is a 16-bit counter. Always use `(uint16_t)(ms_now() - start)` for elapsed time. |
-| **SPI1EN at bit 9** | APB2ENR bit 9, not bit 12. Bit 12 is a different peripheral on this device. |
+| **SPI1EN at bit 9** | APB2ENR bit 9. Not bit 12 — that is TIM1EN (see below). |
+| **TIM1EN at bit 12** | APB2ENR bit 12, NOT bit 11 as on STM32F0/F1. Confirmed by live OpenOCD register scan on Raz DC25000. Using bit 11 leaves TIM1 clocks off → `ms_now()` always returns 0 → all frame timing broken. |
 | **VDDA = 3.0 V** | The LDO outputs 3.0 V, not 3.3 V. All ADC voltage calculations must use 3.0 V. |
 | **ADC base = 0x40020800** | Not the common 0x40012400. Confirmed by live OpenOCD register reads. |
 | **CS must stay LOW** | GC9107 requires CS to be held LOW for the entire multi-command init sequence and for each fill/window operation. Do not deassert CS between commands in a single transfer. |
