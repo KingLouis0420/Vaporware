@@ -57,6 +57,12 @@ try:
 except ImportError:
     HAS_MSS = False
 
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
+
 # ── Protocol ──────────────────────────────────────────────────────────────────
 FAST_IDX_ADDR  = 0x20000100
 FAST_BUF_ADDR  = 0x20000104   # IDX(4) + 4096 bytes of pixel data
@@ -95,10 +101,30 @@ OCD_TELNET_PORT = 4444
 
 # ── Color conversion ──────────────────────────────────────────────────────────
 def image_to_chunks(img):
-    """Convert any PIL Image → 10 raw chunk byte-strings (4096 B each, BGR565 LE)."""
-    img = img.convert("RGB").resize((LCD_W, LCD_H), Image.LANCZOS)
-    data = img.tobytes()
+    """Convert any PIL Image → 10 raw chunk byte-strings (4096 B each, BGR565 LE).
 
+    Uses numpy for fast vectorised BGR565 packing when available (~10× faster
+    than the pure-Python fallback).  The fallback is kept for environments
+    where numpy is not installed.
+    """
+    img = img.convert("RGB").resize((LCD_W, LCD_H), Image.LANCZOS)
+
+    if HAS_NUMPY:
+        # Shape: (LCD_H, LCD_W, 3) — dtype uint8
+        arr = np.frombuffer(img.tobytes(), dtype=np.uint8).reshape(LCD_H, LCD_W, 3)
+        r = arr[:, :, 0].astype(np.uint16)
+        g = arr[:, :, 1].astype(np.uint16)
+        b = arr[:, :, 2].astype(np.uint16)
+        # BGR565: b[4:0] g[5:0] r[4:0]  packed as little-endian uint16
+        bgr565 = ((b >> 3) << 11) | ((g >> 2) << 5) | (r >> 3)
+        # Force little-endian byte order then view as raw bytes
+        bgr565_le = bgr565.astype('<u2')
+        raw = bgr565_le.tobytes()   # (LCD_H * LCD_W * 2) bytes, row-major
+        return [raw[ci * LCD_W * CHUNK_ROWS * 2 : (ci + 1) * LCD_W * CHUNK_ROWS * 2]
+                for ci in range(NUM_CHUNKS)]
+
+    # Pure-Python fallback (no numpy)
+    data = img.tobytes()
     chunks = []
     for ci in range(NUM_CHUNKS):
         row0 = ci * CHUNK_ROWS
