@@ -838,7 +838,7 @@ def main():
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--test",   action="store_true",
                       help="Animated rainbow test pattern")
-    mode.add_argument("--screen", nargs="*", metavar=("X","Y","W","H"),
+    mode.add_argument("--screen", nargs="*", metavar="XYWH",
                       help="Capture screen region [x y w h] (default: full monitor)")
     mode.add_argument("--window", metavar="TITLE",
                       help="Capture window by title substring (Windows only)")
