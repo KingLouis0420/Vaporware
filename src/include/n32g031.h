@@ -72,9 +72,15 @@ typedef struct {
 #define RCC_CR_PLLON        (1UL << 24)
 #define RCC_CR_PLLRDY       (1UL << 25)
 
-/* RCC_CFGR bits */
-#define RCC_CFGR_SW_PLL     (0x2UL << 0)
-#define RCC_CFGR_SWS_PLL    (0x2UL << 2)
+/* RCC_CFGR bits
+ * SW=10 (bit1) selects PLL as SYSCLK; must be written BEFORE PLLON.
+ * SWS on N32G031 is NOT at bits[3:2] — the hardware never updates those bits.
+ * Instead, bit14 is set by hardware when PLL becomes SYSCLK and cleared when
+ * SYSCLK returns to HSI.  Confirmed by SRAM snapshot: CFGR = 0x20104002 with
+ * bit14=1 when PLLRDY fired with SW=10, and CFGR = 0x20100000 (bit14=0) after
+ * SW was reverted to HSI. */
+#define RCC_CFGR_SW_PLL     (0x2UL << 0)   /* SW=10: request PLL as SYSCLK */
+#define RCC_CFGR_SWS_PLL    (1UL << 14)    /* bit14: hardware confirms PLL is SYSCLK */
 #define RCC_CFGR_PLLSRC_HSI (0UL << 16)
 /* PLLMUL: HSI(8MHz) × 6 = 48MHz → bits[21:18]=4 → 0x00100000 */
 #define RCC_CFGR_PLLMULL_6  (4UL << 18)
@@ -225,7 +231,8 @@ typedef struct {
 #define SPI_CR1_SSI         (1UL << 8)   /* Internal slave select (must be 1 in master+SSM) */
 #define SPI_CR1_SSM         (1UL << 9)   /* Software slave management (NSS controlled by SSI) */
 #define SPI_CR1_DFF         (1UL << 11)  /* Data frame format: 0=8-bit, 1=16-bit */
-#define SPI_CR1_BIDIMODE    (1UL << 15)  /* Bidirectional mode (not used) */
+#define SPI_CR1_BIDIOE      (1UL << 14)  /* Bidirectional output enable: 1=TX-only (MOSI only, no RX) */
+#define SPI_CR1_BIDIMODE    (1UL << 15)  /* Bidirectional mode enable: 1=half-duplex 1-wire SPI */
 
 /* SPI_CR2 bits */
 #define SPI_CR2_RXDMAEN     (1UL << 0)   /* RX buffer DMA enable */

@@ -89,20 +89,70 @@ void clock_boost_48mhz(void) {
      * PLLSRC = 0 selects HSI direct (8 MHz, NOT HSI/2 on this device).
      * 8 MHz × 6 = 48 MHz — confirmed by n32g031.h comment. */
 
-    /* 1. Flash: 1 wait state + prefetch — MUST come before the clock switch */
-    FLASH_IF->ACR = (1UL << 4) | (1UL << 0);   /* PRFTBE | LATENCY_1WS */
+    /* 1. Flash: 2 wait states + prefetch — MUST come before the clock switch.
+     * The N32G031 runs at 3.0 V (not 3.3 V); at this voltage the flash
+     * needs 2 wait states above ~24 MHz to guarantee correct reads.
+     * 2WS is safe at any frequency up to the device maximum. */
+    FLASH_IF->ACR = (1UL << 4) | (2UL << 0);   /* PRFTBE | LATENCY_2WS */
 
-    /* 2. Configure PLL: HSI (PLLSRC=0) × 6 (PLLMULL_6) */
-    RCC->CFGR = (RCC->CFGR & ~((0xFUL << 18) | (1UL << 16)))
-              | RCC_CFGR_PLLMULL_6;             /* bit16=0 (HSI src) */
+    /* Sentinel log at 0x20000040..0x2000005C — readable via OpenOCD mdw.
+     * Each slot is overwritten as execution progresses:
+     *   [0x40] = 0xAA001111 → reached step 2 (PLL config)
+     *   [0x44] = 0xBB002222 → PLLON asserted
+     *   [0x48] = 0xCC003333 → PLLRDY confirmed  / 0xEE005555 if timed out
+     *   [0x4C] = 0xDD004444 → SW write done
+     *   [0x50] = CFGR after SW write + SWS wait
+     *   [0x54] = CFGR2  [0x58] = CFGR3  [0x5C] = CR  */
+    volatile uint32_t *dbg = (volatile uint32_t *)0x20000040UL;
 
-    /* 3. Enable PLL; wait for hardware lock */
+    /* 2. Configure PLL: HSI (PLLSRC=0) × 6 (PLLMULL_6).
+     * Set SW=PLL here, BEFORE enabling PLL (PLLON).
+     * On N32G031 the hardware auto-switches SYSCLK to PLL the moment PLLRDY
+     * asserts — writing SW after PLLON may miss the switch window.
+     * SW=10 (0x2) is PLL selector (confirmed: SW=01 = HSE, rejects when HSE off). */
+    dbg[0] = 0xAA001111UL;
+    RCC->CFGR = (RCC->CFGR & ~((0xFUL << 18) | (1UL << 16) | 0x3UL))
+              | RCC_CFGR_PLLMULL_6              /* PLLMULL_6 = ×6 */
+              | RCC_CFGR_SW_PLL;               /* SW=10 set BEFORE PLLON */
+
+    /* 3. Enable PLL and wait for lock + SYSCLK switch together.
+     * N32G031 sets bit14 (RCC_CFGR_SWS_PLL) when PLL becomes SYSCLK —
+     * the conventional SWS field at bits[3:2] never updates on this device.
+     * bit14 is hardware-set on PLLRDY and hardware-cleared on SW revert. */
+    dbg[1] = 0xBB002222UL;
     RCC->CR |= (1UL << 24);                     /* PLLON */
-    while (!(RCC->CR & (1UL << 25)));           /* spin on PLLRDY */
+    {
+        uint32_t i;
+        for (i = 0; i < 200000UL; i++) {
+            IWDG_FEED();
+            if ((RCC->CR   & (1UL << 25)) &&        /* PLLRDY set */
+                (RCC->CFGR & RCC_CFGR_SWS_PLL))     /* bit14: PLL is SYSCLK */
+                break;
+        }
+        if (!(RCC->CR & (1UL << 25))) {
+            dbg[2] = 0xEE005555UL;              /* PLLRDY TIMED OUT */
+            FLASH_IF->ACR = (1UL << 4) | (0UL << 0);
+            RCC->CFGR = (RCC->CFGR & ~0x3UL);  /* SW = 00 (HSI) */
+            RCC->CR &= ~(1UL << 24);            /* PLLON = 0 */
+            return;
+        }
+        dbg[2] = 0xCC003333UL;                  /* PLLRDY confirmed */
+    }
 
-    /* 4. Switch SYSCLK source to PLL */
-    RCC->CFGR = (RCC->CFGR & ~0x3UL) | RCC_CFGR_SW_PLL;
-    while ((RCC->CFGR & 0xCUL) != RCC_CFGR_SWS_PLL);  /* wait for SWS==PLL */
+    /* 4. Snapshot and check — bit14 should be set if PLL is SYSCLK. */
+    dbg[3] = 0xDD004444UL;
+    dbg[4] = RCC->CFGR;   /* CFGR: expect bit14=1, SW=10 */
+    dbg[5] = RCC->CFGR2;  /* CFG2 — PREDIV / routing bits */
+    dbg[6] = RCC->CFGR3;  /* CFG3 — EMCCTRL              */
+    dbg[7] = RCC->CR;     /* CR   — PLLRDY, PLLON         */
+
+    if (!(RCC->CFGR & RCC_CFGR_SWS_PLL)) {
+        /* bit14 not set — PLL did not become SYSCLK; revert safely */
+        RCC->CFGR = (RCC->CFGR & ~0x3UL);           /* SW = 00 (HSI) */
+        FLASH_IF->ACR = (1UL << 4) | (0UL << 0);    /* PRFTBE, 0WS   */
+        RCC->CR &= ~(1UL << 24);                     /* PLLON = 0     */
+        return;
+    }
 
     /* 5. Recalibrate TIM3: 48 MHz / (47+1) = 1 MHz → 1 ms tick unchanged */
     TIM3->CR1 = 0;
@@ -122,8 +172,8 @@ void tim1_init(void) {
      * after clock_boost_48mhz().
      *   HSI 8 MHz:  PSC = 7999  → 8 000 000 / 8000 = 1 kHz
      *   PLL 48 MHz: PSC = 47999 → 48 000 000 / 48000 = 1 kHz
-     * SWS[1:0] (RCC_CFGR bits[3:2]) = 0b10 means PLL is the clock source. */
-    uint32_t psc = ((RCC->CFGR & 0xCUL) == RCC_CFGR_SWS_PLL) ? 47999u : 7999u;
+     * RCC_CFGR_SWS_PLL = bit14 (N32G031): set when PLL is SYSCLK. */
+    uint32_t psc = (RCC->CFGR & RCC_CFGR_SWS_PLL) ? 47999u : 7999u;
     TIM1->PSC = psc;
     TIM1->ARR = 0xFFFF;  /* Full 16-bit range: wraps after 65535 ms */
 

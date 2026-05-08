@@ -17,6 +17,7 @@
 
 #define LCD_CS_LOW()    GPIO_CLR(LCD_CS_PORT,  LCD_CS_PIN)
 #define LCD_CS_HIGH()   GPIO_SET(LCD_CS_PORT,  LCD_CS_PIN)
+
 #define LCD_DC_CMD()    GPIO_CLR(LCD_DC_PORT,  LCD_DC_PIN)
 #define LCD_DC_DATA()   GPIO_SET(LCD_DC_PORT,  LCD_DC_PIN)
 #define LCD_RST_LOW()   GPIO_CLR(LCD_RST_PORT, LCD_RST_PIN)
@@ -74,9 +75,28 @@ static void display_gpio_init(void) {
     LCD_DC_DATA();
     LCD_RST_HIGH();
 
-    /* SPI1: master, mode 0 (CPOL=0 CPHA=0), 8-bit, APB2/2, software NSS */
-    SPI1->CR1 = SPI_CR1_MSTR | SPI_CR1_SSM | SPI_CR1_SSI |
-                SPI_CR1_BR_DIV2 | SPI_CR1_SPE;
+    /* SPI1: full-duplex master, mode 0, 8-bit, software NSS.
+     *
+     * Full-duplex is used (no BIDIMODE) so RXNE asserts reliably after every
+     * spi_write_byte() call.  This lets the OVR clear sequence (read DR then
+     * read SR, both while RXNE=1) work correctly before each large pixel burst.
+     *
+     * N32G031 OVR behaviour: after a large TXE-only burst, the 1-byte RX FIFO
+     * overflows on every received echo byte.  OVR accumulates across multiple
+     * calls without clearing.  After ~2–3 full-screen bursts the OVR state
+     * permanently deadlocks TXE.  Clearing OVR (DR+SR) before each burst resets
+     * this and allows unlimited sequential transfers.
+     *
+     * BIDIMODE was tried but found NOT to suppress OVR on N32G031 (TXE still
+     * deadlocks), and BIDIMODE does suppress RXNE, making DR+SR OVR-clear
+     * impossible (RXNE stays 0, so reading DR never properly clears OVR).
+     *
+     * Target SPI clock regardless of SYSCLK:
+     *   At  8 MHz PCLK: BR_DIV2  =  4 MHz (proven baseline)
+     *   At 48 MHz PCLK: BR_DIV16 =  3 MHz (safe for GC9107) */
+    uint32_t br = (RCC->CFGR & RCC_CFGR_SWS_PLL)  /* PLL is SYSCLK */
+                  ? SPI_CR1_BR_DIV16 : SPI_CR1_BR_DIV2;
+    SPI1->CR1 = SPI_CR1_MSTR | SPI_CR1_SSM | SPI_CR1_SSI | br | SPI_CR1_SPE;
     SPI1->CR2 = 0;
 }
 
@@ -225,45 +245,65 @@ void display_set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
 void display_fill(uint16_t color) {
     uint8_t hi = color >> 8, lo = color & 0xFF;
     LCD_CS_LOW();
+    /* Debug sentinels — read via OpenOCD mrw to locate deadlock.
+     * 0x20000090 = 0xEE110000: entered display_fill
+     * 0x20000094 = 0xEE220000: past SPE toggle, entering display_set_window
+     * 0x20000098 = 0xEE330000: display_set_window done, entering pixel loop
+     * 0x2000009C = 0xEE440000: pixel loop done, in while(BSY)             */
+    *(volatile uint32_t *)0x20000090UL = 0xEE110000UL;
+    SPI1->CR1 &= ~SPI_CR1_SPE;   /* SPE=0: reset SPI — clears OVR, RXNE, all flags */
+    SPI1->CR1 |=  SPI_CR1_SPE;   /* SPE=1: fresh start, TXE=1, BSY=0, OVR=0        */
+    *(volatile uint32_t *)0x20000094UL = 0xEE220000UL;
     display_set_window(0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1);
     LCD_DC_DATA();
-    for (uint32_t i = 0; i < (uint32_t)LCD_WIDTH * LCD_HEIGHT; i++) {
-        while (!(SPI1->SR & SPI_SR_TXE));
-        *(volatile uint8_t *)&SPI1->DR = hi;
-        while (!(SPI1->SR & SPI_SR_TXE));
-        *(volatile uint8_t *)&SPI1->DR = lo;
+    *(volatile uint32_t *)0x20000098UL = 0xEE330000UL;
+    /* Per-row IWDG feed prevents watchdog reset across consecutive fills.
+     * IWDG default timeout = ~273ms (LSI=60kHz, PR=0, RLR=0xFFF).
+     * Each row takes ~1.36ms at 3MHz; feeding every row keeps the gap <2ms. */
+    for (uint16_t row = 0; row < LCD_HEIGHT; row++) {
+        IWDG_FEED();
+        for (uint16_t col = 0; col < LCD_WIDTH; col++) {
+            spi_write_byte(hi);
+            spi_write_byte(lo);
+        }
     }
-    while (SPI1->SR & SPI_SR_BSY);
+    *(volatile uint32_t *)0x2000009CUL = 0xEE440000UL;
     LCD_CS_HIGH();
 }
 
 void display_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color) {
     uint8_t hi = color >> 8, lo = color & 0xFF;
     LCD_CS_LOW();
+    SPI1->CR1 &= ~SPI_CR1_SPE;
+    SPI1->CR1 |=  SPI_CR1_SPE;
     display_set_window(x, y, x + w - 1, y + h - 1);
     LCD_DC_DATA();
-    for (uint32_t i = 0; i < (uint32_t)w * h; i++) {
-        while (!(SPI1->SR & SPI_SR_TXE));
-        *(volatile uint8_t *)&SPI1->DR = hi;
-        while (!(SPI1->SR & SPI_SR_TXE));
-        *(volatile uint8_t *)&SPI1->DR = lo;
+    for (uint16_t row = 0; row < h; row++) {
+        IWDG_FEED();
+        for (uint16_t col = 0; col < w; col++) {
+            spi_write_byte(hi);
+            spi_write_byte(lo);
+        }
     }
-    while (SPI1->SR & SPI_SR_BSY);
     LCD_CS_HIGH();
 }
 
 void display_draw_image(const uint16_t *img, uint16_t x, uint16_t y,
                         uint16_t w, uint16_t h) {
     LCD_CS_LOW();
+    SPI1->CR1 &= ~SPI_CR1_SPE;
+    SPI1->CR1 |=  SPI_CR1_SPE;
     display_set_window(x, y, x + w - 1, y + h - 1);
     LCD_DC_DATA();
-    uint32_t npix = (uint32_t)w * h;
-    for (uint32_t i = 0; i < npix; i++) {
-        uint16_t px = img[i];
-        while (!(SPI1->SR & SPI_SR_TXE)); *(volatile uint8_t *)&SPI1->DR = px >> 8;
-        while (!(SPI1->SR & SPI_SR_TXE)); *(volatile uint8_t *)&SPI1->DR = px & 0xFF;
+    for (uint16_t row = 0; row < h; row++) {
+        IWDG_FEED();
+        const uint16_t *rowp = img + (uint32_t)row * w;
+        for (uint16_t col = 0; col < w; col++) {
+            uint16_t px = rowp[col];
+            spi_write_byte((uint8_t)(px >> 8));
+            spi_write_byte((uint8_t)(px & 0xFF));
+        }
     }
-    while (SPI1->SR & SPI_SR_BSY);
     LCD_CS_HIGH();
 }
 
@@ -281,8 +321,11 @@ void display_draw_chunk_2x(const uint16_t *src, uint16_t log_row,
      * produce two horizontally-adjacent physical pixels; the outer pass
      * loop repeats each logical row twice for vertical doubling.
      * Total SPI output: log_w * log_h * 4 * 2 bytes = same as 128×(log_h*2). */
+    IWDG_FEED();
     uint16_t pr = (uint16_t)(log_row * 2u);
     LCD_CS_LOW();
+    SPI1->CR1 &= ~SPI_CR1_SPE;
+    SPI1->CR1 |=  SPI_CR1_SPE;
     display_set_window(0u, pr, 127u, (uint16_t)(pr + log_h * 2u - 1u));
     LCD_DC_DATA();
     for (uint16_t lr = 0u; lr < log_h; lr++) {
@@ -292,16 +335,14 @@ void display_draw_chunk_2x(const uint16_t *src, uint16_t log_row,
                 uint16_t px = row[lc];
                 uint8_t  hi = (uint8_t)(px >> 8);
                 uint8_t  lo = (uint8_t)(px & 0xFFu);
-                /* left physical pixel */
                 while (!(SPI1->SR & SPI_SR_TXE)); *(volatile uint8_t *)&SPI1->DR = hi;
                 while (!(SPI1->SR & SPI_SR_TXE)); *(volatile uint8_t *)&SPI1->DR = lo;
-                /* right physical pixel (same colour) */
                 while (!(SPI1->SR & SPI_SR_TXE)); *(volatile uint8_t *)&SPI1->DR = hi;
                 while (!(SPI1->SR & SPI_SR_TXE)); *(volatile uint8_t *)&SPI1->DR = lo;
             }
         }
     }
-    while (SPI1->SR & SPI_SR_BSY);
+    for (volatile uint32_t _d = 300u; _d--; );
     LCD_CS_HIGH();
 }
 
@@ -333,7 +374,10 @@ void display_draw_chunk_cpu(const uint16_t *buf, uint16_t row_start, uint16_t nr
     /* CPU-polled SPI blit: identical to display_draw_image but fixed full-width.
      * Simpler than DMA — avoids DMA channel-mapping uncertainty on N32G031.
      * At 24 MHz SPI (PLL mode) each 128×16 chunk takes ~1.4 ms.             */
+    IWDG_FEED();
     LCD_CS_LOW();
+    SPI1->CR1 &= ~SPI_CR1_SPE;
+    SPI1->CR1 |=  SPI_CR1_SPE;
     display_set_window(0u, row_start,
                        (uint16_t)(LCD_WIDTH - 1u),
                        (uint16_t)(row_start + nrows - 1u));
@@ -344,7 +388,11 @@ void display_draw_chunk_cpu(const uint16_t *buf, uint16_t row_start, uint16_t nr
         while (!(SPI1->SR & SPI_SR_TXE)); *(volatile uint8_t *)&SPI1->DR = (uint8_t)(px >> 8);
         while (!(SPI1->SR & SPI_SR_TXE)); *(volatile uint8_t *)&SPI1->DR = (uint8_t)(px & 0xFF);
     }
-    while (SPI1->SR & SPI_SR_BSY);
+    /* Fixed drain: BSY/TXE polling deadlocks on N32G031 after TXE-only bursts.
+     * 300 cycles @ 48 MHz ≈ 6.25 µs = 2× byte-time at 3 MHz SPI — enough for
+     * both the last TX-FIFO byte and the shift register byte to clock out fully
+     * before CS is raised. */
+    for (volatile uint32_t _d = 300u; _d--; );
     LCD_CS_HIGH();
 }
 
@@ -387,7 +435,7 @@ void display_draw_chunk_dma(const uint16_t *buf, uint16_t row_start, uint16_t nr
     while (!(DMA1->ISR & DMA_ISR_TCIF3)) { IWDG_FEED(); }
     DMA1->IFCR = DMA_IFCR_CTCIF3;   /* clear TC flag */
 
-    while (SPI1->SR & SPI_SR_BSY);  /* drain shift register before CS high */
+    while (SPI1->SR & SPI_SR_BSY);           /* clear OVR and wait for shift reg drain */
     SPI1->CR2 &= ~SPI_CR2_TXDMAEN;
     LCD_CS_HIGH();
 }

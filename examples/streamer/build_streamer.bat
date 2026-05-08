@@ -39,8 +39,10 @@ echo [5/5] streamer.c + link
 %SIZE% build\streamer.elf
 
 echo.
+python gen_direct_flash.py || goto :error
+echo.
 echo Build SUCCESS: build\streamer.bin
-echo Next: python gen_direct_flash.py   then   flash_vape.bat
+echo Next: flash_vape.bat
 goto :eof
 
 :error
