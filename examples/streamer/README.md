@@ -79,21 +79,32 @@ python stream_frames.py --halt --wsl
 
 ## Playing FreeDM (Chocolate DOOM)
 
-All assets are in `examples/streamer/doom/chocolate-doom/`:
+> **The DOOM binaries and WAD are not included in this repo** (gitignored).
+> Download them once and place them in `examples/streamer/doom/chocolate-doom/`.
 
-| File | Purpose |
+### Download
+
+| File | Source |
 |---|---|
-| `chocolate-doom.exe` | Chocolate DOOM 3.1.1 |
-| `freedm.wad` | FreeDM (free DOOM replacement IWAD) |
-| `chocolate-doom.cfg` | Pre-configured: windowed, 533×400 |
+| `chocolate-doom.exe` | [chocolate-doom.org/downloads](https://www.chocolate-doom.org/wiki/index.php/Downloads) — grab the Windows ZIP, extract `chocolate-doom.exe` |
+| `freedm.wad` | [freedoom.github.io](https://freedoom.github.io/download.html) — grab the FreeDM ZIP, extract `freedm.wad` |
 
-Launch DOOM first, then start the streamer:
+Place both files here:
+```
+examples/streamer/doom/chocolate-doom/
+    chocolate-doom.exe
+    freedm.wad
+    chocolate-doom.cfg   ← already in repo (windowed, 533×400)
+```
+
+### Launch
 
 ```cmd
 cd examples\streamer\doom\chocolate-doom
 chocolate-doom.exe -iwad freedm.wad
 ```
 
+Then in a second window:
 ```cmd
 cd examples\streamer
 python stream_frames.py --window "FreeDM" --wsl
@@ -195,16 +206,22 @@ K_Y to arbitrary content is impractical.
 ## Python Dependencies
 
 ```cmd
-pip install pillow mss
+pip install pillow mss numpy pywin32
 ```
 
-| Package | Purpose |
+| Package | Required for |
 |---|---|
-| `pillow` | Window capture (`ImageGrab`, `win32gui.PrintWindow`) |
-| `mss` | Fast screen region capture |
+| `pillow` | All streaming modes (screen, window, video) |
+| `mss` | Fast screen-region capture (`--screen`) |
+| `numpy` | 10× faster BGR565 conversion (optional but recommended) |
+| `pywin32` | Window capture by title (`--window`) |
 
-OpenOCD must be installed in WSL and accessible as `openocd` on `$PATH`.
-The ST-Link is attached to WSL automatically via `usbipd` on startup.
+OpenOCD must be installed in WSL (`sudo apt install openocd`) and accessible as
+`openocd` on `$PATH`. The ST-Link is attached to WSL automatically via `usbipd`
+on startup — the script hardcodes `--busid 1-2`. If your ST-Link is on a
+different bus ID, find it with `usbipd list` (PowerShell) and edit the
+`usbipd attach` line in `flash_vape.bat` and the equivalent call in
+`stream_frames.py`.
 
 ---
 

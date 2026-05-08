@@ -57,18 +57,57 @@ Vaporware/
 
 ## Prerequisites
 
-| Tool | Purpose |
-|---|---|
-| [Arm GNU Toolchain 14.2](https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads) | `arm-none-eabi-gcc` — cross-compiler |
-| [OpenOCD](https://openocd.org) | Flash and debug via ST-Link (runs under WSL) |
-| [ST-Link V2](https://www.amazon.com/s?k=st-link+v2) | SWD programmer (~$8) |
-| WSL 2 + [usbipd-win](https://github.com/dorssel/usbipd-win) | Attach ST-Link USB to WSL for OpenOCD |
+### Hardware
 
-The toolchain is expected at:
+| Item | Notes |
+|---|---|
+| [ST-Link V2](https://www.amazon.com/s?k=st-link+v2) | SWD programmer (~$8) — keep plugged in for streaming too |
+| Raz DC25000 vape | Or any device with an N32G031 + GC9107 |
+
+### Software
+
+**1 — Arm GNU Toolchain 14.2** (cross-compiler)
+
+Download from [developer.arm.com](https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads).
+Install to the default path or update the `GCC` / `OBJCOPY` / `SIZE` lines at the top of each `build_*.bat`:
 ```
 C:\Program Files (x86)\Arm GNU Toolchain arm-none-eabi\14.2 rel1\bin\
 ```
-If yours is elsewhere, update the `GCC` / `OBJCOPY` / `SIZE` lines at the top of the example's `build_*.bat`.
+
+**2 — WSL 2** (Windows Subsystem for Linux)
+
+```powershell
+wsl --install          # installs Ubuntu by default — reboot if prompted
+```
+
+**3 — OpenOCD in WSL** (flash and SWD debug server)
+
+```bash
+sudo apt update && sudo apt install openocd
+```
+
+**4 — usbipd-win** (share ST-Link USB with WSL)
+
+Download the installer from [github.com/dorssel/usbipd-win/releases](https://github.com/dorssel/usbipd-win/releases).
+
+After installing, find your ST-Link bus ID (run in PowerShell with ST-Link plugged in):
+```powershell
+usbipd list
+```
+Look for a line like `1-2   0483:3748  STMicroelectronics ST-Link`. The `build_*.bat` and `flash_vape.bat` scripts hardcode `--busid 1-2` — if yours differs, edit that line in the batch file.
+
+**5 — Python 3 + pip packages** (for host-side tools and streamer)
+
+```cmd
+pip install pillow mss numpy pywin32
+```
+
+| Package | Required for |
+|---|---|
+| `pillow` | All streaming modes (screen, window, video) |
+| `mss` | Fast screen-region capture (`--screen`) |
+| `numpy` | 10× faster BGR565 conversion (optional but recommended) |
+| `pywin32` | Window capture by title (`--window`) |
 
 ---
 
